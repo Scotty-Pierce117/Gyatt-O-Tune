@@ -1,3 +1,0 @@
-[console_scripts]
-gyatt-o-tune = scattersyncms.main:main
-scattersyncms = scattersyncms.main:main

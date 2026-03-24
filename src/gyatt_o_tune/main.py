@@ -6,13 +6,13 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from scattersyncms.ui.main_window import MainWindow
+from gyatt_o_tune.ui.main_window import MainWindow
 
 
 def _asset_path(filename: str) -> Path:
     if getattr(sys, "frozen", False):
         base_path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
-        return base_path / "scattersyncms" / "assets" / filename
+        return base_path / "gyatt_o_tune" / "assets" / filename
     return Path(__file__).resolve().parent / "assets" / filename
 
 

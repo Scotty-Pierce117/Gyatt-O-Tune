@@ -36,8 +36,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QSettings
 
-from scattersyncms.core.io import AxisVector, LogLoader, TableData, TuneData, TuneLoader
-from scattersyncms.ui.log_viewer_window import LogViewerWindow
+from gyatt_o_tune.core.io import AxisVector, LogLoader, TableData, TuneData, TuneLoader
+from gyatt_o_tune.ui.log_viewer_window import LogViewerWindow
 
 
 class CopyPasteTableWidget(QTableWidget):
@@ -778,7 +778,7 @@ class MainWindow(QMainWindow):
         self.tunerstudio_names_action.triggered.connect(self._on_tunerstudio_names_toggled)
 
     def _load_recent_files(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         recent_tunes = settings.value("recent_tune_files", [])
         recent_logs = settings.value("recent_log_files", [])
 
@@ -786,17 +786,17 @@ class MainWindow(QMainWindow):
         self.recent_log_files = [Path(p) for p in recent_logs if Path(p).exists()]
 
     def _save_recent_files(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("recent_tune_files", [str(p) for p in self.recent_tune_files])
         settings.setValue("recent_log_files", [str(p) for p in self.recent_log_files])
 
     def _load_favorites(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         favorites = settings.value("favorite_tables", [])
         self.favorite_tables = set(favorites) if favorites else set()
 
     def _save_favorites(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("favorite_tables", list(self.favorite_tables))
 
     def _default_row_viz_preferences(self) -> dict[str, dict[str, bool]]:
@@ -823,7 +823,7 @@ class MainWindow(QMainWindow):
         }
 
     def _load_row_viz_preferences(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         saved = settings.value("row_viz_preferences")
         defaults = self._default_row_viz_preferences()
         if not isinstance(saved, dict):
@@ -839,7 +839,7 @@ class MainWindow(QMainWindow):
         self.row_viz_preferences = merged
 
     def _save_row_viz_preferences(self) -> None:
-        settings = QSettings("ScatterSyncMS", "ScatterSyncMS")
+        settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("row_viz_preferences", self.row_viz_preferences)
 
     def _row_table_type(self) -> str:

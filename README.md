@@ -16,7 +16,7 @@ Desktop app for analyzing MegaSquirt tune files and log files:
 3. Install the project:
    - `pip install -e .`
 4. Run the app:
-   - `python -m scattersyncms.main`
+   - `python -m gyatt_o_tune.main`
    - or `gyatt-o-tune`
 
 ## Build a portable Windows `.exe`

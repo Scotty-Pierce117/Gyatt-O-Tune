@@ -5,13 +5,13 @@ project_root = Path(SPECPATH).resolve()
 
 
 a = Analysis(
-    [str(project_root / "src" / "scattersyncms" / "main.py")],
+    [str(project_root / "src" / "gyatt_o_tune" / "main.py")],
     pathex=[str(project_root / "src")],
     binaries=[],
     datas=[
         (
-            str(project_root / "src" / "scattersyncms" / "assets" / "gyatt-o-tune.svg"),
-            "scattersyncms/assets",
+            str(project_root / "src" / "gyatt_o_tune" / "assets" / "gyatt-o-tune.svg"),
+            "gyatt_o_tune/assets",
         ),
     ],
     hiddenimports=[],

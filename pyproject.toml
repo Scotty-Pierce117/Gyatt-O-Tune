@@ -17,8 +17,8 @@ build = [
 ]
 
 [project.scripts]
-gyatt-o-tune = "scattersyncms.main:main"
-scattersyncms = "scattersyncms.main:main"
+gyatt-o-tune = "gyatt_o_tune.main:main"
+gyatt_o_tune = "gyatt_o_tune.main:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -31,4 +31,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-scattersyncms = ["assets/*.svg"]
+gyatt_o_tune = ["assets/*.svg"]

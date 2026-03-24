@@ -22,13 +22,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from scattersyncms.core.io import LogLoader
+from gyatt_o_tune.core.io import LogLoader
 
 
 class LogViewerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ScatterSyncMS - Log Viewer")
+        self.setWindowTitle("Gyatt-O-Tune - Log Viewer")
         self.resize(1200, 800)
 
         self.log_loader = LogLoader()
