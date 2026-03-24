@@ -11,6 +11,11 @@ dependencies = [
     "numpy>=1.26.0",
 ]
 
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.14.0",
+]
+
 [project.scripts]
 gyatt-o-tune = "scattersyncms.main:main"
 scattersyncms = "scattersyncms.main:main"

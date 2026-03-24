@@ -9,11 +9,18 @@ from PySide6.QtWidgets import QApplication
 from scattersyncms.ui.main_window import MainWindow
 
 
+def _asset_path(filename: str) -> Path:
+    if getattr(sys, "frozen", False):
+        base_path = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        return base_path / "scattersyncms" / "assets" / filename
+    return Path(__file__).resolve().parent / "assets" / filename
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Gyatt-O-Tune")
 
-    icon_path = Path(__file__).resolve().parent / "assets" / "gyatt-o-tune.svg"
+    icon_path = _asset_path("gyatt-o-tune.svg")
     if icon_path.exists():
         app_icon = QIcon(str(icon_path))
         app.setWindowIcon(app_icon)
