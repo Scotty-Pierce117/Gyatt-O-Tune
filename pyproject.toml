@@ -1,0 +1,29 @@
+[project]
+name = "gyatt-o-tune"
+version = "0.1.0"
+description = "MegaSquirt tune and log analysis desktop app"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7.0",
+    "pyqtgraph>=0.13.7",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+gyatt-o-tune = "scattersyncms.main:main"
+scattersyncms = "scattersyncms.main:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scattersyncms = ["assets/*.svg"]

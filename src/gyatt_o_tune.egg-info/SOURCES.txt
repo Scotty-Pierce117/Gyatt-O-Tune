@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+src/gyatt_o_tune.egg-info/PKG-INFO
+src/gyatt_o_tune.egg-info/SOURCES.txt
+src/gyatt_o_tune.egg-info/dependency_links.txt
+src/gyatt_o_tune.egg-info/entry_points.txt
+src/gyatt_o_tune.egg-info/requires.txt
+src/gyatt_o_tune.egg-info/top_level.txt
+src/scattersyncms/__init__.py
+src/scattersyncms/main.py
+src/scattersyncms/assets/gyatt-o-tune.svg
+src/scattersyncms/core/__init__.py
+src/scattersyncms/core/io.py
+src/scattersyncms/ui/__init__.py
+src/scattersyncms/ui/log_viewer_window.py
+src/scattersyncms/ui/main_window.py
