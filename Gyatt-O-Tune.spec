@@ -13,6 +13,10 @@ a = Analysis(
             str(project_root / "src" / "gyatt_o_tune" / "assets" / "gyatt-o-tune.svg"),
             "gyatt_o_tune/assets",
         ),
+        (
+            str(project_root / "src" / "gyatt_o_tune" / "assets" / "gyatt-o-tune.ico"),
+            "gyatt_o_tune/assets",
+        ),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -43,4 +47,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(project_root / "src" / "gyatt_o_tune" / "assets" / "gyatt-o-tune.ico"),
 )

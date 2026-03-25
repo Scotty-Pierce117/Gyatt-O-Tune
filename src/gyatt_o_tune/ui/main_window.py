@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -112,8 +111,10 @@ class RowVisualizationPanel(QGroupBox):
         self._selected_point: tuple[str, int] | None = None
         self._point_sets: list[dict[str, Any]] = []
         self.on_point_selected: Any = None
+        self.on_point_adjust_requested: Any = None
         self.on_visibility_changed: Any = None
         self.legend: Any = None
+        self._table_type = "generic"
         self._y_label_text = "Value"
         
         # Visibility toggles for different data series
@@ -137,7 +138,8 @@ class RowVisualizationPanel(QGroupBox):
         self.table_scatter = pg.ScatterPlotItem(size=8, name="Selected Row Points")
         self.raw_scatter = pg.ScatterPlotItem(pen=pg.mkPen(95, 140, 205, 170, width=1), brush=pg.mkBrush(95, 140, 205, 115), size=6, name="Raw VE1")
         self.corrected_scatter = pg.ScatterPlotItem(pen=pg.mkPen(95, 175, 115, 170, width=1), brush=pg.mkBrush(95, 175, 115, 115), size=6, name="EGO Corrected VE")
-        self.average_curve = pg.PlotCurveItem(pen=pg.mkPen(235, 170, 85, width=3), name="Average from Log")
+        self.average_curve = pg.PlotCurveItem(pen=pg.mkPen(235, 170, 85, width=3), name="Predicted VE")
+        self.average_scatter = pg.ScatterPlotItem(pen=pg.mkPen(235, 170, 85, 220, width=2), brush=pg.mkBrush(235, 170, 85, 200), size=8, name="Predicted VE Points")
         self.afr_scatter = pg.ScatterPlotItem(pen=pg.mkPen(80, 155, 200, 170, width=1), brush=pg.mkBrush(80, 155, 200, 115), size=6, name="AFR")
         self.afr_target_scatter = pg.ScatterPlotItem(pen=pg.mkPen(165, 120, 205, 170, width=1), brush=pg.mkBrush(165, 120, 205, 115), size=6, name="AFR Target")
         self.afr_error_scatter = pg.ScatterPlotItem(pen=pg.mkPen(220, 170, 100, 170, width=1), brush=pg.mkBrush(220, 170, 100, 115), size=6, name="AFR Error")
@@ -172,7 +174,7 @@ class RowVisualizationPanel(QGroupBox):
         self.check_corrected.toggled.connect(self._on_toggle_corrected)
         toggle_layout.addWidget(self.check_corrected)
         
-        self.check_average = QCheckBox("Average from Log")
+        self.check_average = QCheckBox("Predicted VE")
         self.check_average.setChecked(True)
         self.check_average.toggled.connect(self._on_toggle_average)
         toggle_layout.addWidget(self.check_average)
@@ -216,8 +218,6 @@ class RowVisualizationPanel(QGroupBox):
         left_bottom_widget = QWidget()
         left_bottom_layout = QVBoxLayout(left_bottom_widget)
         left_bottom_layout.setContentsMargins(0, 0, 0, 0)
-        self.cursor_label = QLabel("Cursor: RPM -, Value -")
-        left_bottom_layout.addWidget(self.cursor_label)
         self.selected_point_label = QLabel("Selected point: none")
         self.selected_point_label.setWordWrap(True)
         left_bottom_layout.addWidget(self.selected_point_label)
@@ -242,7 +242,81 @@ class RowVisualizationPanel(QGroupBox):
             slot=self._on_mouse_moved,
         )
         self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        self.plot.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.plot.installEventFilter(self)
+        self.plot.viewport().installEventFilter(self)
         self.clear_visualization()
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # type: ignore[override]
+        if watched in {self.plot, self.plot.viewport()}:
+            if event.type() == QEvent.Type.Wheel:
+                target_index = self._selected_table_index_for_adjustment()
+                if target_index is None:
+                    return False
+
+                delta = event.angleDelta().y()
+                if delta == 0:
+                    delta = event.pixelDelta().y()
+                if delta == 0:
+                    return False
+                steps = max(1, abs(delta) // 120) if abs(delta) >= 120 else 1
+                increment = 0.5 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 0.1
+                amount = float(steps * increment if delta > 0 else -steps * increment)
+                if callable(self.on_point_adjust_requested):
+                    # Ensure subsequent refreshes preserve selection and keep wheel-edit active.
+                    self.select_table_point(target_index, emit_callback=False)
+                    self.on_point_adjust_requested(target_index, amount)
+                    event.accept()
+                    return True
+
+            if event.type() == QEvent.Type.KeyPress:
+                if self._selected_point is None:
+                    return False
+                series_id, index = self._selected_point
+                if series_id != "table":
+                    return False
+
+                key = event.key()
+                if key != Qt.Key.Key_Tab and key != Qt.Key.Key_Backtab:
+                    return False
+
+                table_series = self._get_series("table")
+                if table_series is None:
+                    return False
+                point_count = len(table_series.get("rpm", []))
+                if point_count <= 0:
+                    return False
+
+                next_index = index - 1 if key == Qt.Key.Key_Backtab else index + 1
+                if next_index < 0 or next_index >= point_count:
+                    return True
+
+                self.select_table_point(next_index, emit_callback=True)
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def _selected_table_index_for_adjustment(self) -> int | None:
+        if self._selected_point is None:
+            return None
+
+        table_series = self._get_series("table")
+        if table_series is None:
+            return None
+
+        table_rpm_values = table_series.get("rpm", [])
+        if not hasattr(table_rpm_values, "__len__") or len(table_rpm_values) == 0:
+            return None
+
+        series_id, index = self._selected_point
+        if series_id != "table":
+            # Only adjust values when a table point is selected; all other series
+            # fall through so the wheel event is passed on for normal graph zooming.
+            return None
+
+        if 0 <= index < len(table_rpm_values):
+            return index
+        return None
 
     def _on_toggle_table(self, checked: bool) -> None:
         self._show_table = checked
@@ -295,6 +369,7 @@ class RowVisualizationPanel(QGroupBox):
         self.raw_scatter.show() if self._show_raw else self.raw_scatter.hide()
         self.corrected_scatter.show() if self._show_corrected else self.corrected_scatter.hide()
         self.average_curve.show() if self._show_average else self.average_curve.hide()
+        self.average_scatter.show() if self._show_average else self.average_scatter.hide()
         self.afr_scatter.show() if self._show_afr else self.afr_scatter.hide()
         self.afr_target_scatter.show() if self._show_afr_target else self.afr_target_scatter.hide()
         self.afr_error_scatter.show() if self._show_afr_error else self.afr_error_scatter.hide()
@@ -343,6 +418,7 @@ class RowVisualizationPanel(QGroupBox):
     def clear_visualization(self, title: str = "No data selected", stats_text: str = "") -> None:
         self._selected_point = None
         self._point_sets = []
+        self._table_type = "generic"
         self._y_label_text = "Value"
         self._remove_legend()
         self.plot.clear()
@@ -350,14 +426,14 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.setLabel('left', self._y_label_text)
         self.plot.setLabel('bottom', 'RPM')
         self.stats_text.setPlainText(stats_text)
-        self.cursor_label.setText("Cursor: RPM -, Value -")
         self.selected_point_label.setText("Selected point: none")
         self._add_plot_items()
         self._apply_view_all()
 
-    def set_row_data(self, payload: dict[str, Any]) -> None:
+    def set_row_data(self, payload: dict[str, Any], auto_view_all: bool = True) -> None:
         self._selected_point = None
         self._point_sets = list(payload.get("point_sets", []))
+        self._table_type = str(payload.get("table_type", "generic"))
         self._y_label_text = str(payload.get("y_label", "Value"))
         x_label_text = str(payload.get("x_label", "RPM"))
         available_series = [str(s) for s in payload.get("available_series", [])]
@@ -369,12 +445,12 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.setLabel('left', self._y_label_text)
         self.plot.setLabel('bottom', x_label_text)
         self.stats_text.setPlainText(str(payload.get("stats", "")))
-        self.cursor_label.setText("Cursor: RPM -, Value -")
         self.selected_point_label.setText("Selected point: none")
         self._add_plot_items()
         self._refresh_point_styles()
         self._refresh_visibility()
-        self._apply_view_all()
+        if auto_view_all:
+            self._apply_view_all()
 
     def _apply_view_all(self) -> None:
         plot_item = self.plot.getPlotItem()
@@ -391,6 +467,7 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.addItem(self.raw_scatter)
         self.plot.addItem(self.corrected_scatter)
         self.plot.addItem(self.average_curve)
+        self.plot.addItem(self.average_scatter)
         self.plot.addItem(self.afr_scatter)
         self.plot.addItem(self.afr_target_scatter)
         self.plot.addItem(self.afr_error_scatter)
@@ -429,7 +506,10 @@ class RowVisualizationPanel(QGroupBox):
         self.afr_error_scatter.setZValue(10)
         self.knock_scatter.setZValue(10)
         self.average_curve.setZValue(30)
-        self.table_curve.setZValue(31)
+        self.average_scatter.setZValue(31)
+        self.table_curve.setZValue(32)
+        self.table_scatter.setZValue(33)
+        self.selected_marker.setZValue(40)
         self.table_scatter.setZValue(32)
         self.selected_marker.setZValue(40)
         self.crosshair_vline.setZValue(60)
@@ -452,7 +532,7 @@ class RowVisualizationPanel(QGroupBox):
             ("table", self.table_curve, "Selected Row", self._show_table),
             ("raw", self.raw_scatter, "Raw VE1", self._show_raw),
             ("corrected", self.corrected_scatter, "EGO Corrected VE", self._show_corrected),
-            ("average", self.average_curve, "Average from Log", self._show_average),
+            ("average", self.average_curve, "Predicted VE", self._show_average),
             ("afr", self.afr_scatter, "AFR", self._show_afr),
             ("afr_target", self.afr_target_scatter, "AFR Target", self._show_afr_target),
             ("afr_error", self.afr_error_scatter, "AFR Error", self._show_afr_error),
@@ -498,8 +578,10 @@ class RowVisualizationPanel(QGroupBox):
 
         if average_series is not None:
             self.average_curve.setData(average_series["rpm"], average_series["ve"])
+            self.average_scatter.setData(x=average_series["rpm"], y=average_series["ve"])
         else:
             self.average_curve.setData([], [])
+            self.average_scatter.setData([], [])
 
         if afr_series is not None:
             self.afr_scatter.setData(x=afr_series["rpm"], y=afr_series["ve"])
@@ -547,6 +629,28 @@ class RowVisualizationPanel(QGroupBox):
         self.selected_marker.setData([float(rpm_values[index])], [float(ve_values[index])])
         self.selected_marker.show()
 
+    def selected_table_point_index(self) -> int | None:
+        if self._selected_point is None:
+            return None
+        series_id, index = self._selected_point
+        if series_id != "table":
+            return None
+        return index
+
+    def select_table_point(self, index: int, emit_callback: bool = False) -> None:
+        table_series = self._get_series("table")
+        if table_series is None:
+            return
+        rpm_values = table_series.get("rpm", [])
+        if index < 0 or index >= len(rpm_values):
+            return
+
+        self._selected_point = ("table", index)
+        self._refresh_point_styles()
+        self.selected_point_label.setText(self._format_selected_point_text(table_series, index))
+        if emit_callback and callable(self.on_point_selected):
+            self.on_point_selected("table", index, float(rpm_values[index]))
+
     @staticmethod
     def _format_value(value: float | None, suffix: str = "") -> str:
         if value is None:
@@ -554,15 +658,27 @@ class RowVisualizationPanel(QGroupBox):
         return f"{value:.2f}{suffix}"
 
     def _format_selected_point_text(self, series: dict[str, Any], index: int) -> str:
+        def value_at(key: str) -> float | None:
+            values = series.get(key, [])
+            if isinstance(values, list) and 0 <= index < len(values):
+                return values[index]
+            return None
+
         name = str(series.get("name", "Point"))
         rpm = float(series["rpm"][index])
         map_val = float(series["map"][index])
         ve = float(series["ve"][index])
-        ve_raw = series.get("ve_raw", [None])[index]
-        ve_scaled = series.get("ve_scaled", [None])[index]
-        afr = series.get("afr", [None])[index]
-        afr_target = series.get("afr_target", [None])[index]
-        afr_error = series.get("afr_error", [None])[index]
+        ve_raw = value_at("ve_raw")
+        ve_scaled = value_at("ve_scaled")
+        afr = value_at("afr")
+        afr_predicted = value_at("afr_predicted")
+        afr_target = value_at("afr_target")
+        afr_error = value_at("afr_error")
+        time_elapsed = value_at("time_elapsed")
+        cranking_status = value_at("cranking_status")
+        warmup_enrichment = value_at("warmup_enrichment")
+        startup_enrichment = value_at("startup_enrichment")
+        ignition_advance = value_at("ignition_advance")
 
         lines = [
             f"Selected point ({name})",
@@ -570,17 +686,31 @@ class RowVisualizationPanel(QGroupBox):
         ]
         series_id = str(series.get("series_id"))
         if series_id == "corrected":
+            if self._table_type == "ve" and ve_scaled is not None and ve_raw is not None and abs(float(ve_raw)) > 1e-9:
+                ve_offset_pct = ((float(ve_scaled) - float(ve_raw)) / float(ve_raw)) * 100.0
+                lines.append(f"Offset vs Raw VE: {ve_offset_pct:+.2f}%")
             lines.append(f"VE scaled: {self._format_value(ve_scaled, '%')}")
             lines.append(f"VE unscaled: {self._format_value(ve_raw, '%')}")
         elif series_id == "table":
             lines.append(f"Selected row value: {ve:.2f}")
+            if afr_predicted is not None:
+                lines.append(f"AFR predicted: {self._format_value(afr_predicted)}")
         elif series_id in {"afr", "afr_target", "afr_error", "knock"}:
             lines.append(f"Value: {ve:.2f}")
         else:
             lines.append(f"VE: {ve:.2f}%")
-        lines.append(f"AFR: {self._format_value(afr)}")
+        lines.append(f"AFR Actual: {self._format_value(afr)}")
         lines.append(f"AFR target: {self._format_value(afr_target)}")
         lines.append(f"AFR error: {self._format_value(afr_error)}")
+        if series_id == "knock":
+            lines.append(f"Time elapsed: {self._format_value(time_elapsed, ' s')}")
+            if cranking_status is None:
+                lines.append("Cranking status: n/a")
+            else:
+                lines.append(f"Cranking status: {'On' if float(cranking_status) >= 0.5 else 'Off'}")
+            lines.append(f"Warm-up enrichment: {self._format_value(warmup_enrichment, '%')}")
+            lines.append(f"Start-up enrichment: {self._format_value(startup_enrichment, '%')}")
+            lines.append(f"Ignition advance: {self._format_value(ignition_advance, ' deg')}")
         return "\n".join(lines)
 
     def _on_mouse_moved(self, evt: tuple[Any]) -> None:
@@ -598,7 +728,6 @@ class RowVisualizationPanel(QGroupBox):
         if not plot_item.sceneBoundingRect().contains(pos):
             self.crosshair_vline.hide()
             self.crosshair_hline.hide()
-            self.cursor_label.setText("Cursor: RPM -, Value -")
             return
 
         mouse_point = vb.mapSceneToView(pos)
@@ -608,7 +737,6 @@ class RowVisualizationPanel(QGroupBox):
         self.crosshair_hline.setPos(ve)
         self.crosshair_vline.show()
         self.crosshair_hline.show()
-        self.cursor_label.setText(f"Cursor: RPM {rpm:.1f}, Value {ve:.2f}")
 
     def _on_mouse_clicked(self, evt: Any) -> None:
         if evt is None or evt.button() != Qt.MouseButton.LeftButton:
@@ -622,6 +750,7 @@ class RowVisualizationPanel(QGroupBox):
         click_pos = evt.scenePos()
         if not plot_item.sceneBoundingRect().contains(click_pos):
             return
+        self.plot.setFocus()
 
         click_view = vb.mapSceneToView(click_pos)
         click_rpm = float(click_view.x())
@@ -725,7 +854,8 @@ class RowEditorTableWidget(QTableWidget):
             super().wheelEvent(event)
             return
         steps = max(1, abs(delta) // 120)
-        amount = float(steps * 0.1 if delta > 0 else -steps * 0.1)
+        increment = 0.5 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 0.1
+        amount = float(steps * increment if delta > 0 else -steps * increment)
         self.on_adjust_value(current_column, amount)
         event.accept()
 
@@ -737,7 +867,7 @@ class RowVisualizationPreferencesDialog(QDialog):
         "table": "Selected Row Data",
         "raw": "Raw VE1",
         "corrected": "EGO Corrected VE",
-        "average": "Average from Log",
+        "average": "Predicted VE",
         "afr": "AFR",
         "afr_target": "AFR Target",
         "afr_error": "AFR Error",
@@ -822,15 +952,18 @@ class MainWindow(QMainWindow):
         self.row_default_values: list[float] = []
         self.row_edit_undo_stack: list[list[float]] = []
         self.average_line_data: dict[str, Any] | None = None
+        self._last_row_viz_dataset_key: tuple[Any, ...] | None = None
         self.selected_rows_per_table: dict[str, int] = {}  # Track selected row for each table
         self.pending_edits_per_table: dict[str, dict] = {}  # Track unsaved edits per table
 
         self.recent_tune_files: list[Path] = []
         self.recent_log_files: list[Path] = []
+        self.working_folder: Path | None = None
 
         self.favorite_tables: set[str] = set()
         self.only_show_favorited_tables = False
         self.show_1d_tables = True
+        self.show_2d_tables = True
         self.show_tunerstudio_names = True
         self.row_viz_preferences: dict[str, dict[str, bool]] = self._default_row_viz_preferences()
 
@@ -838,6 +971,7 @@ class MainWindow(QMainWindow):
         self._load_favorites()
         self._load_table_filter_preferences()
         self._load_row_viz_preferences()
+        self._load_working_folder()
 
         self._create_menu()
         self._create_layout()
@@ -854,8 +988,19 @@ class MainWindow(QMainWindow):
         open_tune_action = file_menu.addAction("Open &Tune File...")
         open_tune_action.triggered.connect(self._open_tune_file)
 
+        select_working_folder_action = file_menu.addAction("Select &Working Folder...")
+        select_working_folder_action.triggered.connect(self._on_select_working_folder)
+
         self.recent_tunes_menu = file_menu.addMenu("Recent &Tune Files")
         self._update_recent_tunes_menu()
+
+        load_recent_tune_action = file_menu.addAction("Load Most Recent Tune")
+        load_recent_tune_action.setShortcut(QKeySequence("Ctrl+T"))
+        load_recent_tune_action.triggered.connect(self._on_load_most_recent_tune_shortcut)
+
+        load_matching_log_action = file_menu.addAction("Load Matching Log File")
+        load_matching_log_action.setShortcut(QKeySequence("Ctrl+L"))
+        load_matching_log_action.triggered.connect(self._on_load_matching_log_shortcut)
 
         self.save_tune_as_action = file_menu.addAction("Save Tune &As...")
         self.save_tune_as_action.triggered.connect(self._save_tune_as)
@@ -881,17 +1026,148 @@ class MainWindow(QMainWindow):
         self.tunerstudio_names_action.setChecked(True)
         self.tunerstudio_names_action.triggered.connect(self._on_tunerstudio_names_toggled)
 
-        self.only_show_favorited_tables_action = view_menu.addAction("Only Show &Favorited Tables")
+        self.only_show_favorited_tables_action = view_menu.addAction("&Favorite Tables Only")
         self.only_show_favorited_tables_action.setCheckable(True)
         self.only_show_favorited_tables_action.setChecked(self.only_show_favorited_tables)
         self.only_show_favorited_tables_action.triggered.connect(self._on_only_show_favorited_toggled)
+
+        self.show_2d_tables_action = view_menu.addAction("Show &2D Tables")
+        self.show_2d_tables_action.setCheckable(True)
+        self.show_2d_tables_action.setChecked(self.show_2d_tables)
+        self.show_2d_tables_action.triggered.connect(self._on_show_2d_tables_toggled)
 
         self.show_1d_tables_action = view_menu.addAction("Show &1D Tables")
         self.show_1d_tables_action.setCheckable(True)
         self.show_1d_tables_action.setChecked(self.show_1d_tables)
         self.show_1d_tables_action.triggered.connect(self._on_show_1d_tables_toggled)
-        # Grey out 1D tables option when showing only favorited tables
+        # Grey out dimensional filters when showing only favorited tables
+        self.show_2d_tables_action.setEnabled(not self.only_show_favorited_tables)
         self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
+
+    def _on_load_most_recent_tune_shortcut(self) -> None:
+        """Ctrl+T: load most recent tune from working folder or recent files."""
+        most_recent = self._most_recent_tune_file()
+        if most_recent is None:
+            self.statusBar().showMessage("No recent tune file found to load.", 5000)
+            return
+
+        # Show a confirmation popup when a working folder is set
+        if self.working_folder and most_recent.parent == self.working_folder:
+            msg_box = QMessageBox(self)
+            msg_box.setIcon(QMessageBox.Icon.Question)
+            msg_box.setWindowTitle("Load Tune File")
+            msg_box.setText(f"Load most recent tune?\n\n{most_recent.name}")
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+            if msg_box.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        self._open_recent_tune_file(most_recent)
+
+    def _on_load_matching_log_shortcut(self) -> None:
+        """Ctrl+L: load a .msl or .mlg file with the same name as the loaded tune."""
+        if self.tune_data is None or self.loaded_tune_path is None:
+            QMessageBox.warning(
+                self,
+                "No Tune Loaded",
+                "Please load a tune file first before loading a matching log."
+            )
+            return
+
+        tune_file = self.loaded_tune_path
+        if tune_file.suffix.lower() != ".msq":
+            QMessageBox.warning(
+                self,
+                "Invalid Tune File",
+                "The loaded tune must be an .msq file to find a matching log."
+            )
+            return
+
+        tune_stem = tune_file.stem.lower()
+        matching_logs: list[Path] = []
+        seen: set[Path] = set()
+
+        # 1) Prefer exact same-name logs next to the tune file.
+        for suffix in (".msl", ".mlg"):
+            candidate = tune_file.with_suffix(suffix)
+            if candidate.exists():
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    matching_logs.append(resolved)
+                    seen.add(resolved)
+
+        # 2) Include same-stem logs from recent log history.
+        for recent_log in self.recent_log_files:
+            resolved = recent_log.resolve()
+            if not resolved.exists():
+                continue
+            if resolved.suffix.lower() not in {".msl", ".mlg"}:
+                continue
+            if resolved.stem.lower() != tune_stem:
+                continue
+            if resolved not in seen:
+                matching_logs.append(resolved)
+                seen.add(resolved)
+
+        # 3) Include same-stem logs from default tuning data directory.
+        data_dir = self._default_data_dir()
+        if data_dir.exists():
+            for suffix in ("*.msl", "*.mlg"):
+                for candidate in data_dir.glob(suffix):
+                    resolved = candidate.resolve()
+                    if resolved.stem.lower() != tune_stem:
+                        continue
+                    if resolved not in seen:
+                        matching_logs.append(resolved)
+                        seen.add(resolved)
+
+        if not matching_logs:
+            QMessageBox.warning(
+                self,
+                "No Matching Log Found",
+                f"Could not find a .msl or .mlg file named '{tune_stem}' to load."
+            )
+            return
+
+        # Prefer .msl, fall back to first available
+        preferred_log = next((p for p in matching_logs if p.suffix.lower() == ".msl"), matching_logs[0])
+        self._open_recent_log_file(preferred_log)
+
+    def _most_recent_tune_file(self) -> Path | None:
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+
+        # 1) Prioritize working folder if set
+        if self.working_folder and self.working_folder.exists():
+            for path in self.working_folder.glob("*.msq"):
+                resolved = path.resolve()
+                if resolved.exists() and resolved not in seen:
+                    candidates.append(resolved)
+                    seen.add(resolved)
+
+        # 2) Then include recent tune files
+        for path in self.recent_tune_files:
+            resolved = path.resolve()
+            if resolved.exists() and resolved.suffix.lower() == ".msq" and resolved not in seen:
+                candidates.append(resolved)
+                seen.add(resolved)
+
+        # 3) Finally include default data directory
+        data_dir = self._default_data_dir()
+        if data_dir.exists():
+            for path in data_dir.glob("*.msq"):
+                resolved = path.resolve()
+                if resolved.exists() and resolved not in seen:
+                    candidates.append(resolved)
+                    seen.add(resolved)
+
+        if not candidates:
+            return None
+
+        try:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return None
 
     def _load_recent_files(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
@@ -906,6 +1182,33 @@ class MainWindow(QMainWindow):
         settings.setValue("recent_tune_files", [str(p) for p in self.recent_tune_files])
         settings.setValue("recent_log_files", [str(p) for p in self.recent_log_files])
 
+    def _load_working_folder(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        working_folder_str = settings.value("working_folder", "")
+        if working_folder_str and Path(working_folder_str).exists():
+            self.working_folder = Path(working_folder_str)
+        else:
+            self.working_folder = None
+
+    def _save_working_folder(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        if self.working_folder:
+            settings.setValue("working_folder", str(self.working_folder))
+        else:
+            settings.remove("working_folder")
+
+    def _on_select_working_folder(self) -> None:
+        """Open folder selection dialog and save the working folder."""
+        selected_folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Working Folder",
+            str(self.working_folder) if self.working_folder else str(Path.cwd())
+        )
+        if selected_folder:
+            self.working_folder = Path(selected_folder)
+            self._save_working_folder()
+            self.statusBar().showMessage(f"Working folder set to: {self.working_folder.name}", 5000)
+
     def _load_favorites(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
         favorites = settings.value("favorite_tables", [])
@@ -919,11 +1222,13 @@ class MainWindow(QMainWindow):
         settings = QSettings("GyattOTune", "GyattOTune")
         self.only_show_favorited_tables = bool(settings.value("only_show_favorited_tables", False, type=bool))
         self.show_1d_tables = bool(settings.value("show_1d_tables", True, type=bool))
+        self.show_2d_tables = bool(settings.value("show_2d_tables", True, type=bool))
 
     def _save_table_filter_preferences(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("only_show_favorited_tables", self.only_show_favorited_tables)
         settings.setValue("show_1d_tables", self.show_1d_tables)
+        settings.setValue("show_2d_tables", self.show_2d_tables)
 
     def _default_row_viz_preferences(self) -> dict[str, dict[str, bool]]:
         return {
@@ -1005,12 +1310,30 @@ class MainWindow(QMainWindow):
     def _is_current_table_1d(self) -> bool:
         return self.current_table is not None and (self.current_table.rows == 1 or self.current_table.cols == 1)
 
-    def _one_d_table_plot_data(self) -> tuple[list[float], list[float], str]:
+    def _active_row_editor_axis_values(self) -> list[float]:
+        if self.current_table is None:
+            return []
+
+        if self._is_current_table_1d():
+            if self.current_table.rows == 1:
+                if self.current_x_axis is not None and len(self.current_x_axis.values) == self.current_table.cols:
+                    return [float(v) for v in self.current_x_axis.values]
+                return [float(i + 1) for i in range(self.current_table.cols)]
+
+            if self.current_y_axis is not None and len(self.current_y_axis.values) == self.current_table.rows:
+                return [float(v) for v in self.current_y_axis.values]
+            return [float(i + 1) for i in range(self.current_table.rows)]
+
+        if self.current_x_axis is None:
+            return []
+        return [float(v) for v in self.current_x_axis.values]
+
+    def _one_d_table_plot_data(self, override_values: list[float] | None = None) -> tuple[list[float], list[float], str]:
         if self.current_table is None:
             return [], [], "Index"
 
         if self.current_table.rows == 1:
-            y_values = [float(v) for v in self.current_table.values[0]]
+            y_values = [float(v) for v in (override_values if override_values is not None else self.current_table.values[0])]
             if self.current_x_axis is not None and len(self.current_x_axis.values) == len(y_values):
                 x_values = [float(v) for v in self.current_x_axis.values]
                 x_label = self.current_x_axis.name or "X"
@@ -1019,7 +1342,7 @@ class MainWindow(QMainWindow):
                 x_label = "Index"
             return x_values, y_values, x_label
 
-        y_values = [float(row[0]) for row in self.current_table.values]
+        y_values = [float(v) for v in (override_values if override_values is not None else [row[0] for row in self.current_table.values])]
         if self.current_y_axis is not None and len(self.current_y_axis.values) == len(y_values):
             x_values = [float(v) for v in self.current_y_axis.values]
             x_label = self.current_y_axis.name or "Y"
@@ -1028,8 +1351,8 @@ class MainWindow(QMainWindow):
             x_label = "Index"
         return x_values, y_values, x_label
 
-    def _build_1d_table_visualization_payload(self) -> dict[str, Any]:
-        x_values, y_values, x_label = self._one_d_table_plot_data()
+    def _build_1d_table_visualization_payload(self, override_values: list[float] | None = None) -> dict[str, Any]:
+        x_values, y_values, x_label = self._one_d_table_plot_data(override_values)
         table_name = self.current_table.name if self.current_table is not None else "Table"
         units = self.current_table.units if self.current_table is not None else None
 
@@ -1059,12 +1382,59 @@ class MainWindow(QMainWindow):
         if self.log_df is not None and not self.log_df.empty and "knock" in table_name.lower():
             rpm_channel = None
             knock_channel = None
+            afr_channel = None
+            afr_target_channel = None
+            afr_error_channel = None
+            time_elapsed_channel = None
+            cranking_channel = None
+            warmup_enrichment_channel = None
+            startup_enrichment_channel = None
+            ignition_advance_channel = None
             for col in self.log_df.columns:
                 col_lower = str(col).lower()
                 if rpm_channel is None and ('rpm' in col_lower or 'engine speed' in col_lower):
                     rpm_channel = str(col)
                 if knock_channel is None and ('knock in' in col_lower or 'knock_in' in col_lower or 'knockin' in col_lower):
                     knock_channel = str(col)
+                if (
+                    not afr_channel
+                    and ('afr' in col_lower or 'lambda' in col_lower)
+                    and 'target' not in col_lower
+                    and 'tgt' not in col_lower
+                    and 'error' not in col_lower
+                    and 'err' not in col_lower
+                ):
+                    afr_channel = str(col)
+                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
+                    afr_target_channel = str(col)
+                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
+                    afr_error_channel = str(col)
+                if not time_elapsed_channel and (
+                    ('time' in col_lower and ('sec' in col_lower or 'elapsed' in col_lower))
+                    or col_lower in {'time', 'seconds', 'sec'}
+                ):
+                    time_elapsed_channel = str(col)
+                if not cranking_channel and 'crank' in col_lower:
+                    cranking_channel = str(col)
+                if not warmup_enrichment_channel and (
+                    'warmup' in col_lower
+                    or 'warm up' in col_lower
+                    or 'wue' in col_lower
+                ):
+                    warmup_enrichment_channel = str(col)
+                if not startup_enrichment_channel and (
+                    'startup' in col_lower
+                    or 'start up' in col_lower
+                    or 'afterstart' in col_lower
+                    or 'ase' in col_lower
+                ):
+                    startup_enrichment_channel = str(col)
+                if (
+                    not ignition_advance_channel
+                    and ('advance' in col_lower or ('ign' in col_lower and 'adv' in col_lower) or ('spark' in col_lower and 'adv' in col_lower))
+                    and 'table' not in col_lower
+                ):
+                    ignition_advance_channel = str(col)
             if knock_channel is None:
                 for col in self.log_df.columns:
                     col_lower = str(col).lower()
@@ -1075,6 +1445,14 @@ class MainWindow(QMainWindow):
             if rpm_channel and knock_channel:
                 rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
                 knock_series = self._to_numeric_series(self.log_df[knock_channel])
+                afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
+                afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
+                afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
+                time_elapsed_series = self._to_numeric_series(self.log_df[time_elapsed_channel]) if time_elapsed_channel else None
+                cranking_series = self._to_numeric_series(self.log_df[cranking_channel]) if cranking_channel else None
+                warmup_enrichment_series = self._to_numeric_series(self.log_df[warmup_enrichment_channel]) if warmup_enrichment_channel else None
+                startup_enrichment_series = self._to_numeric_series(self.log_df[startup_enrichment_channel]) if startup_enrichment_channel else None
+                ignition_advance_series = self._to_numeric_series(self.log_df[ignition_advance_channel]) if ignition_advance_channel else None
                 if rpm_series is not None and knock_series is not None:
                     import numpy as np
 
@@ -1083,6 +1461,27 @@ class MainWindow(QMainWindow):
                     finite = np.isfinite(rpm_vals) & np.isfinite(knock_vals)
                     rpm_vals = rpm_vals[finite]
                     knock_vals = knock_vals[finite]
+
+                    def to_optional_values(series: Any) -> list[float | None]:
+                        if series is None:
+                            return [None] * len(rpm_vals)
+                        values = np.asarray(series, dtype=float)[finite]
+                        return [float(v) if np.isfinite(v) else None for v in values]
+
+                    afr_vals = to_optional_values(afr_series)
+                    afr_target_vals = to_optional_values(afr_target_series)
+                    afr_error_vals = to_optional_values(afr_error_series)
+                    if afr_error_series is None and afr_series is not None and afr_target_series is not None:
+                        afr_error_vals = [
+                            (float(a) - float(t)) if (a is not None and t is not None) else None
+                            for a, t in zip(afr_vals, afr_target_vals)
+                        ]
+                    time_elapsed_vals = to_optional_values(time_elapsed_series)
+                    cranking_vals = to_optional_values(cranking_series)
+                    warmup_vals = to_optional_values(warmup_enrichment_series)
+                    startup_vals = to_optional_values(startup_enrichment_series)
+                    ignition_advance_vals = to_optional_values(ignition_advance_series)
+
                     if len(rpm_vals) > 0:
                         point_sets.append(
                             {
@@ -1093,9 +1492,14 @@ class MainWindow(QMainWindow):
                                 "map": [0.0] * len(rpm_vals),
                                 "ve_raw": [float(v) for v in knock_vals],
                                 "ve_scaled": [float(v) for v in knock_vals],
-                                "afr": [None] * len(rpm_vals),
-                                "afr_target": [None] * len(rpm_vals),
-                                "afr_error": [None] * len(rpm_vals),
+                                "afr": afr_vals,
+                                "afr_target": afr_target_vals,
+                                "afr_error": afr_error_vals,
+                                "time_elapsed": time_elapsed_vals,
+                                "cranking_status": cranking_vals,
+                                "warmup_enrichment": warmup_vals,
+                                "startup_enrichment": startup_vals,
+                                "ignition_advance": ignition_advance_vals,
                             }
                         )
                         stats += f"\nKnock points: {len(rpm_vals)}"
@@ -1289,35 +1693,19 @@ class MainWindow(QMainWindow):
             self._update_recent_logs_menu()
             return
 
-        # Show progress dialog for large files
-        progress = QProgressBar()
-        progress.setRange(0, 0)  # Indeterminate progress
-        progress.setMinimumWidth(300)
-        
-        # Create a modal dialog with the progress bar
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel
-        progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("Loading Log File")
-        progress_dialog.setModal(True)
-        progress_dialog.setFixedSize(350, 100)
-        
-        layout = QVBoxLayout(progress_dialog)
-        layout.addWidget(QLabel(f"Loading {file_path.name}..."))
-        layout.addWidget(progress)
-        progress_dialog.show()
-        
-        # Force UI update
+        # Show wait cursor while loading
+        self.setCursor(Qt.CursorShape.WaitCursor)
         QGuiApplication.processEvents()
 
         try:
             parse_result = self.log_loader.load_log_with_report(file_path)
             log_df = parse_result.dataframe
         except Exception as exc:  # noqa: BLE001
-            progress_dialog.close()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             QMessageBox.critical(self, "Log Load Error", f"Could not load log file:\n{exc}")
             return
 
-        progress_dialog.close()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self.log_file = file_path
         self.statusBar().showMessage(
@@ -1351,8 +1739,11 @@ class MainWindow(QMainWindow):
                 if table_name not in self.favorite_tables:
                     continue
             else:
-                # Show all tables except filter by 1D if needed
-                if not self.show_1d_tables and self._is_1d_table(table_name):
+                # Apply dimensional filters when not in favorites-only mode
+                is_1d = self._is_1d_table(table_name)
+                if is_1d and not self.show_1d_tables:
+                    continue
+                if (not is_1d) and not self.show_2d_tables:
                     continue
             
             display_name = self._get_tunerstudio_name(table_name) if self.show_tunerstudio_names else table_name
@@ -1386,8 +1777,12 @@ class MainWindow(QMainWindow):
         else:
             if self.only_show_favorited_tables:
                 self.table_list.addItem("No favorite tables")
+            elif not self.show_1d_tables and not self.show_2d_tables:
+                self.table_list.addItem("All table types are hidden")
             elif not self.show_1d_tables:
                 self.table_list.addItem("No 2D tables found")
+            elif not self.show_2d_tables:
+                self.table_list.addItem("No 1D tables found")
             else:
                 self.table_list.addItem("No tables found")
 
@@ -1412,10 +1807,17 @@ class MainWindow(QMainWindow):
         self._update_table_display()
 
     def _on_only_show_favorited_toggled(self) -> None:
-        """Handle 'Only Show Favorited Tables' toggle."""
+        """Handle 'Favorite Tables Only' toggle."""
         self.only_show_favorited_tables = self.only_show_favorited_tables_action.isChecked()
-        # Grey out 1D tables option when showing only favorited tables
+        # Grey out table-type filters when showing only favorited tables
+        self.show_2d_tables_action.setEnabled(not self.only_show_favorited_tables)
         self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
+        self._save_table_filter_preferences()
+        self._update_table_display()
+
+    def _on_show_2d_tables_toggled(self) -> None:
+        """Handle 'Show 2D Tables' toggle."""
+        self.show_2d_tables = self.show_2d_tables_action.isChecked()
         self._save_table_filter_preferences()
         self._update_table_display()
 
@@ -1539,6 +1941,7 @@ class MainWindow(QMainWindow):
 
         self.table_row_panel = RowVisualizationPanel()
         self.table_row_panel.on_point_selected = self._on_table_row_plot_point_selected
+        self.table_row_panel.on_point_adjust_requested = self._on_table_row_plot_point_adjust_requested
         self.table_row_panel.on_visibility_changed = self._on_row_viz_visibility_changed
         self.table_details_splitter.addWidget(self.table_row_panel)
 
@@ -1549,10 +1952,13 @@ class MainWindow(QMainWindow):
         self.table_row_label = QLabel("Selected row: none")
         row_editor_controls.addWidget(self.table_row_label)
         row_editor_controls.addStretch(1)
-        self.generate_average_button = QPushButton("Generate Average from Log")
+        self.generate_average_button = QPushButton("Predict VE Value")
+        self.generate_average_button.setToolTip(
+            "Predict VE values from nearby logged VE points using EGO-corrected VE and matching AFR readings."
+        )
         self.generate_average_button.clicked.connect(self._generate_average_line_from_log)
         row_editor_controls.addWidget(self.generate_average_button)
-        self.apply_average_to_row_button = QPushButton("Apply Average To Row")
+        self.apply_average_to_row_button = QPushButton("Apply Predictions")
         self.apply_average_to_row_button.clicked.connect(self._apply_average_to_selected_row)
         row_editor_controls.addWidget(self.apply_average_to_row_button)
         self.apply_row_changes_button = QPushButton("Write Row To Table Grid")
@@ -1638,6 +2044,7 @@ class MainWindow(QMainWindow):
                 "ve_raw": table_point_values,
                 "ve_scaled": table_point_values,
                 "afr": [None] * len(rpm_point_values),
+                "afr_predicted": [None] * len(rpm_point_values),
                 "afr_target": [None] * len(rpm_point_values),
                 "afr_error": [None] * len(rpm_point_values),
             }
@@ -1757,13 +2164,27 @@ class MainWindow(QMainWindow):
             table_afr_values: list[float | None] = []
             table_afr_target_values: list[float | None] = []
             table_afr_error_values: list[float | None] = []
+            table_afr_predicted_values: list[float | None] = []
             for rpm_value in rpm_point_values:
                 nearest_index = min(range(len(filtered_rpm_values)), key=lambda idx: abs(filtered_rpm_values[idx] - rpm_value))
                 table_afr_values.append(filtered_afr_values[nearest_index])
                 table_afr_target_values.append(filtered_afr_target_values[nearest_index])
                 table_afr_error_values.append(filtered_afr_error_values[nearest_index])
 
+            for rpm_value, table_ve_value in zip(rpm_point_values, table_point_values):
+                predicted = self._predict_afr_from_neighbors(
+                    target_rpm=float(rpm_value),
+                    target_map=float(map_value),
+                    target_ve=float(table_ve_value),
+                    rpm_values=filtered_rpm_values,
+                    map_values=filtered_map_values,
+                    ve_corrected_values=filtered_ve_corrected_values,
+                    afr_values=filtered_afr_values,
+                )
+                table_afr_predicted_values.append(predicted)
+
             point_sets[0]["afr"] = table_afr_values
+            point_sets[0]["afr_predicted"] = table_afr_predicted_values
             point_sets[0]["afr_target"] = table_afr_target_values
             point_sets[0]["afr_error"] = table_afr_error_values
 
@@ -1777,6 +2198,7 @@ class MainWindow(QMainWindow):
                     "ve_raw": filtered_ve_raw_values,
                     "ve_scaled": filtered_ve_raw_values,
                     "afr": filtered_afr_values,
+                    "afr_predicted": [None] * len(filtered_rpm_values),
                     "afr_target": filtered_afr_target_values,
                     "afr_error": filtered_afr_error_values,
                 }
@@ -1791,6 +2213,7 @@ class MainWindow(QMainWindow):
                     "ve_raw": filtered_ve_raw_values,
                     "ve_scaled": filtered_ve_corrected_values,
                     "afr": filtered_afr_values,
+                    "afr_predicted": [None] * len(filtered_rpm_values),
                     "afr_target": filtered_afr_target_values,
                     "afr_error": filtered_afr_error_values,
                 }
@@ -1804,6 +2227,12 @@ class MainWindow(QMainWindow):
             stats += f"\n\nLogged Data ({len(filtered_rpm)} points):\n"
             stats += f"Raw VE1: {raw_mean:.1f}% (σ={raw_std:.1f})\n"
             stats += f"EGO Corrected: {corrected_mean:.1f}% (σ={corrected_std:.1f})\n"
+            predicted_only = [v for v in table_afr_predicted_values if v is not None]
+            target_only = [v for v in table_afr_target_values if v is not None]
+            if predicted_only:
+                stats += f"Predicted AFR (row avg): {sum(predicted_only) / len(predicted_only):.2f}\n"
+            if target_only:
+                stats += f"AFR target (row avg): {sum(target_only) / len(target_only):.2f}\n"
             stats += f"RPM range: {filtered_rpm.min():.0f} - {filtered_rpm.max():.0f}"
 
             return {
@@ -2034,6 +2463,11 @@ class MainWindow(QMainWindow):
                 "afr": [None] * len(rpm_point_values),
                 "afr_target": [None] * len(rpm_point_values),
                 "afr_error": [None] * len(rpm_point_values),
+                "time_elapsed": [None] * len(rpm_point_values),
+                "cranking_status": [None] * len(rpm_point_values),
+                "warmup_enrichment": [None] * len(rpm_point_values),
+                "startup_enrichment": [None] * len(rpm_point_values),
+                "ignition_advance": [None] * len(rpm_point_values),
             }
         ]
 
@@ -2054,6 +2488,14 @@ class MainWindow(QMainWindow):
             rpm_channel = None
             map_channel = None
             knock_channel = None
+            afr_channel = None
+            afr_target_channel = None
+            afr_error_channel = None
+            time_elapsed_channel = None
+            cranking_channel = None
+            warmup_enrichment_channel = None
+            startup_enrichment_channel = None
+            ignition_advance_channel = None
 
             for col in self.log_df.columns:
                 col_lower = str(col).lower()
@@ -2063,6 +2505,45 @@ class MainWindow(QMainWindow):
                     map_channel = str(col)
                 if knock_channel is None and ('knock in' in col_lower or 'knock_in' in col_lower or 'knockin' in col_lower):
                     knock_channel = str(col)
+                if (
+                    not afr_channel
+                    and ('afr' in col_lower or 'lambda' in col_lower)
+                    and 'target' not in col_lower
+                    and 'tgt' not in col_lower
+                    and 'error' not in col_lower
+                    and 'err' not in col_lower
+                ):
+                    afr_channel = str(col)
+                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
+                    afr_target_channel = str(col)
+                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
+                    afr_error_channel = str(col)
+                if not time_elapsed_channel and (
+                    ('time' in col_lower and ('sec' in col_lower or 'elapsed' in col_lower))
+                    or col_lower in {'time', 'seconds', 'sec'}
+                ):
+                    time_elapsed_channel = str(col)
+                if not cranking_channel and 'crank' in col_lower:
+                    cranking_channel = str(col)
+                if not warmup_enrichment_channel and (
+                    'warmup' in col_lower
+                    or 'warm up' in col_lower
+                    or 'wue' in col_lower
+                ):
+                    warmup_enrichment_channel = str(col)
+                if not startup_enrichment_channel and (
+                    'startup' in col_lower
+                    or 'start up' in col_lower
+                    or 'afterstart' in col_lower
+                    or 'ase' in col_lower
+                ):
+                    startup_enrichment_channel = str(col)
+                if (
+                    not ignition_advance_channel
+                    and ('advance' in col_lower or ('ign' in col_lower and 'adv' in col_lower) or ('spark' in col_lower and 'adv' in col_lower))
+                    and 'table' not in col_lower
+                ):
+                    ignition_advance_channel = str(col)
 
             if knock_channel is None:
                 for col in self.log_df.columns:
@@ -2082,6 +2563,14 @@ class MainWindow(QMainWindow):
             rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
             map_series = self._to_numeric_series(self.log_df[map_channel])
             knock_series = self._to_numeric_series(self.log_df[knock_channel])
+            afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
+            afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
+            afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
+            time_elapsed_series = self._to_numeric_series(self.log_df[time_elapsed_channel]) if time_elapsed_channel else None
+            cranking_series = self._to_numeric_series(self.log_df[cranking_channel]) if cranking_channel else None
+            warmup_enrichment_series = self._to_numeric_series(self.log_df[warmup_enrichment_channel]) if warmup_enrichment_channel else None
+            startup_enrichment_series = self._to_numeric_series(self.log_df[startup_enrichment_channel]) if startup_enrichment_channel else None
+            ignition_advance_series = self._to_numeric_series(self.log_df[ignition_advance_channel]) if ignition_advance_channel else None
 
             if rpm_series is None or map_series is None or knock_series is None:
                 return {
@@ -2101,6 +2590,14 @@ class MainWindow(QMainWindow):
             filtered_rpm = rpm_series[map_mask]
             filtered_map = map_series[map_mask]
             filtered_knock = knock_series[map_mask]
+            filtered_afr = afr_series[map_mask] if afr_series is not None else None
+            filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
+            filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
+            filtered_time_elapsed = time_elapsed_series[map_mask] if time_elapsed_series is not None else None
+            filtered_cranking = cranking_series[map_mask] if cranking_series is not None else None
+            filtered_warmup_enrichment = warmup_enrichment_series[map_mask] if warmup_enrichment_series is not None else None
+            filtered_startup_enrichment = startup_enrichment_series[map_mask] if startup_enrichment_series is not None else None
+            filtered_ignition_advance = ignition_advance_series[map_mask] if ignition_advance_series is not None else None
 
             if len(filtered_rpm) == 0 and map_tolerance < 20.0:
                 map_tolerance = 20.0
@@ -2108,6 +2605,14 @@ class MainWindow(QMainWindow):
                 filtered_rpm = rpm_series[map_mask]
                 filtered_map = map_series[map_mask]
                 filtered_knock = knock_series[map_mask]
+                filtered_afr = afr_series[map_mask] if afr_series is not None else None
+                filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
+                filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
+                filtered_time_elapsed = time_elapsed_series[map_mask] if time_elapsed_series is not None else None
+                filtered_cranking = cranking_series[map_mask] if cranking_series is not None else None
+                filtered_warmup_enrichment = warmup_enrichment_series[map_mask] if warmup_enrichment_series is not None else None
+                filtered_startup_enrichment = startup_enrichment_series[map_mask] if startup_enrichment_series is not None else None
+                filtered_ignition_advance = ignition_advance_series[map_mask] if ignition_advance_series is not None else None
 
             if len(filtered_rpm) == 0:
                 return {
@@ -2120,6 +2625,47 @@ class MainWindow(QMainWindow):
             filtered_rpm_values = [float(v) for v in filtered_rpm]
             filtered_map_values = [float(v) for v in filtered_map]
             filtered_knock_values = [float(v) for v in filtered_knock]
+            filtered_afr_values = [float(v) for v in filtered_afr] if filtered_afr is not None else [None] * len(filtered_rpm_values)
+            filtered_afr_target_values = [float(v) for v in filtered_afr_target] if filtered_afr_target is not None else [None] * len(filtered_rpm_values)
+            filtered_afr_error_values = [float(v) for v in filtered_afr_error] if filtered_afr_error is not None else [None] * len(filtered_rpm_values)
+            if filtered_afr_error is None and filtered_afr is not None and filtered_afr_target is not None:
+                filtered_afr_error_values = [
+                    (float(a) - float(t)) if (a is not None and t is not None) else None
+                    for a, t in zip(filtered_afr_values, filtered_afr_target_values)
+                ]
+            filtered_time_elapsed_values = [float(v) for v in filtered_time_elapsed] if filtered_time_elapsed is not None else [None] * len(filtered_rpm_values)
+            filtered_cranking_values = [float(v) for v in filtered_cranking] if filtered_cranking is not None else [None] * len(filtered_rpm_values)
+            filtered_warmup_enrichment_values = [float(v) for v in filtered_warmup_enrichment] if filtered_warmup_enrichment is not None else [None] * len(filtered_rpm_values)
+            filtered_startup_enrichment_values = [float(v) for v in filtered_startup_enrichment] if filtered_startup_enrichment is not None else [None] * len(filtered_rpm_values)
+            filtered_ignition_advance_values = [float(v) for v in filtered_ignition_advance] if filtered_ignition_advance is not None else [None] * len(filtered_rpm_values)
+
+            table_afr_values: list[float | None] = []
+            table_afr_target_values: list[float | None] = []
+            table_afr_error_values: list[float | None] = []
+            table_time_elapsed_values: list[float | None] = []
+            table_cranking_values: list[float | None] = []
+            table_warmup_values: list[float | None] = []
+            table_startup_values: list[float | None] = []
+            table_ignition_advance_values: list[float | None] = []
+            for rpm_value in rpm_point_values:
+                nearest_index = min(range(len(filtered_rpm_values)), key=lambda idx: abs(filtered_rpm_values[idx] - rpm_value))
+                table_afr_values.append(filtered_afr_values[nearest_index])
+                table_afr_target_values.append(filtered_afr_target_values[nearest_index])
+                table_afr_error_values.append(filtered_afr_error_values[nearest_index])
+                table_time_elapsed_values.append(filtered_time_elapsed_values[nearest_index])
+                table_cranking_values.append(filtered_cranking_values[nearest_index])
+                table_warmup_values.append(filtered_warmup_enrichment_values[nearest_index])
+                table_startup_values.append(filtered_startup_enrichment_values[nearest_index])
+                table_ignition_advance_values.append(filtered_ignition_advance_values[nearest_index])
+
+            point_sets[0]["afr"] = table_afr_values
+            point_sets[0]["afr_target"] = table_afr_target_values
+            point_sets[0]["afr_error"] = table_afr_error_values
+            point_sets[0]["time_elapsed"] = table_time_elapsed_values
+            point_sets[0]["cranking_status"] = table_cranking_values
+            point_sets[0]["warmup_enrichment"] = table_warmup_values
+            point_sets[0]["startup_enrichment"] = table_startup_values
+            point_sets[0]["ignition_advance"] = table_ignition_advance_values
 
             point_sets.append(
                 {
@@ -2130,9 +2676,14 @@ class MainWindow(QMainWindow):
                     "map": filtered_map_values,
                     "ve_raw": filtered_knock_values,
                     "ve_scaled": filtered_knock_values,
-                    "afr": [None] * len(filtered_rpm_values),
-                    "afr_target": [None] * len(filtered_rpm_values),
-                    "afr_error": [None] * len(filtered_rpm_values),
+                    "afr": filtered_afr_values,
+                    "afr_target": filtered_afr_target_values,
+                    "afr_error": filtered_afr_error_values,
+                    "time_elapsed": filtered_time_elapsed_values,
+                    "cranking_status": filtered_cranking_values,
+                    "warmup_enrichment": filtered_warmup_enrichment_values,
+                    "startup_enrichment": filtered_startup_enrichment_values,
+                    "ignition_advance": filtered_ignition_advance_values,
                 }
             )
 
@@ -2162,7 +2713,7 @@ class MainWindow(QMainWindow):
             return
 
         if self._is_current_table_1d():
-            self._update_table_grid_row_visualization()
+            self._load_selected_table_row(0)
             return
 
         if self.selected_table_row_idx is None:
@@ -2184,13 +2735,13 @@ class MainWindow(QMainWindow):
         self._load_selected_table_row(self.selected_table_row_idx)
 
     def _generate_average_line_from_log(self) -> None:
-        """Generate an average VE line from log data for the current MAP."""
+        """Predict VE values from AFR and EGO-corrected VE log data for the current MAP row."""
         if self.current_table is None or "ve" not in self.current_table.name.lower():
-            self.table_row_status.setText("Average line generation is currently available for VE rows.")
+            self.table_row_status.setText("VE prediction is currently available for VE rows.")
             return
 
         if self.log_df is None or self.log_df.empty:
-            self.table_row_status.setText("No log data loaded. Cannot generate average.")
+            self.table_row_status.setText("No log data loaded. Cannot predict VE.")
             return
 
         if self.selected_table_row_idx is None or self.current_y_axis is None or self.current_x_axis is None:
@@ -2198,13 +2749,15 @@ class MainWindow(QMainWindow):
             return
 
         map_value = float(self.current_y_axis.values[self.selected_table_row_idx])
-        
+
         # Find relevant columns in log data
         rpm_channel = None
         map_channel = None
         ve1_channel = None
         ego_cor1_channel = None
-        
+        afr_channel = None
+        afr_target_channel = None
+
         for col in self.log_df.columns:
             col_lower = str(col).lower()
             if not rpm_channel and ('rpm' in col_lower or 'engine speed' in col_lower):
@@ -2215,87 +2768,135 @@ class MainWindow(QMainWindow):
                 ve1_channel = str(col)
             if not ego_cor1_channel and ('ego' in col_lower and 'cor1' in col_lower):
                 ego_cor1_channel = str(col)
-        
+            if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
+                afr_target_channel = str(col)
+            if (
+                not afr_channel
+                and ('afr' in col_lower or 'lambda' in col_lower)
+                and 'target' not in col_lower
+                and 'tgt' not in col_lower
+                and 'error' not in col_lower
+                and 'err' not in col_lower
+            ):
+                afr_channel = str(col)
+
         if not rpm_channel or not map_channel or not ve1_channel:
             self.table_row_status.setText("Required log columns not found (RPM, MAP, VE1).")
             return
-        
+
+        if not afr_channel:
+            self.table_row_status.setText("AFR channel not found in log. Cannot predict VE without AFR readings.")
+            return
+
         # Convert to numeric series
         rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
         map_series = self._to_numeric_series(self.log_df[map_channel])
         ve_series = self._to_numeric_series(self.log_df[ve1_channel])
-        
-        if rpm_series is None or map_series is None or ve_series is None:
+        afr_series = self._to_numeric_series(self.log_df[afr_channel])
+        afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
+
+        if rpm_series is None or map_series is None or ve_series is None or afr_series is None:
             self.table_row_status.setText("Could not convert log data to numeric values.")
             return
-        
-        # Average generation intentionally uses only EGO-corrected VE values.
+
+        # Apply EGO correction to VE
         ve_corrected_series = ve_series.copy()
         if ego_cor1_channel is not None:
             ego_series = self._to_numeric_series(self.log_df[ego_cor1_channel])
             if ego_series is not None:
                 ve_corrected_series = ve_series * (ego_series / 100.0)
-        
-        # Calculate adaptive tolerance like in _build_row_visualization_payload
+
+        # Calculate adaptive MAP tolerance
         map_tolerance = 10.0
         if self.current_y_axis is not None and len(self.current_y_axis.values) > 1:
             sorted_bins = sorted(float(v) for v in self.current_y_axis.values)
             min_spacing = min(abs(b - a) for a, b in zip(sorted_bins, sorted_bins[1:]))
             map_tolerance = max(10.0, min_spacing * 0.75)
-        
+
         # Filter to current MAP bin
         map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
         filtered_rpm = rpm_series[map_mask]
-        filtered_ve = ve_corrected_series[map_mask]
-        
+        filtered_map = map_series[map_mask]
+        filtered_ve_corrected = ve_corrected_series[map_mask]
+        filtered_afr = afr_series[map_mask]
+        filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
+
         if len(filtered_rpm) == 0:
             self.table_row_status.setText(f"No log data near MAP {map_value} kPa.")
             return
-        
-        # Group by RPM bins and calculate averages
+
+        filtered_rpm_values = [float(v) for v in filtered_rpm]
+        filtered_map_values = [float(v) for v in filtered_map]
+        filtered_ve_corrected_values = [float(v) for v in filtered_ve_corrected]
+        filtered_afr_values: list[float | None] = [float(v) for v in filtered_afr]
+        filtered_afr_target_values: list[float | None] = (
+            [float(v) for v in filtered_afr_target] if filtered_afr_target is not None else [None] * len(filtered_rpm_values)
+        )
+
+        # Predict VE for each RPM bin using AFR-based weighted neighbor averaging
         rpm_bins = [float(v) for v in self.current_x_axis.values]
-        average_rpm_values = []
-        average_ve_values = []
-        
+        average_rpm_values: list[float] = []
+        average_ve_values: list[float] = []
+        average_afr_target_values: list[float | None] = []
+
         for target_rpm in rpm_bins:
-            # Use bins centered on each RPM value (±500 RPM range, or proportional to spacing)
+            # Determine the target AFR for this bin from nearby log points
             rpm_tolerance = 500.0
             if len(rpm_bins) > 1:
                 sorted_rpms = sorted(rpm_bins)
                 min_spacing = min(abs(b - a) for a, b in zip(sorted_rpms, sorted_rpms[1:]))
                 rpm_tolerance = max(300.0, min_spacing * 0.4)
-            
-            rpm_mask = (filtered_rpm >= target_rpm - rpm_tolerance) & (filtered_rpm <= target_rpm + rpm_tolerance)
-            matching_ve = filtered_ve[rpm_mask]
-            
-            if len(matching_ve) > 0:
-                avg_ve = float(matching_ve.mean())
+
+            rpm_mask_bin = [abs(r - target_rpm) <= rpm_tolerance for r in filtered_rpm_values]
+            nearby_afr_target = [v for v, m in zip(filtered_afr_target_values, rpm_mask_bin) if m and v is not None]
+            if afr_target_channel is not None and len(nearby_afr_target) < 2:
+                continue
+            target_afr = float(sum(nearby_afr_target) / len(nearby_afr_target)) if nearby_afr_target else 14.7
+
+            predicted_ve = self._predict_ve_from_neighbors(
+                target_rpm=target_rpm,
+                target_map=map_value,
+                target_afr=target_afr,
+                rpm_values=filtered_rpm_values,
+                map_values=filtered_map_values,
+                ve_corrected_values=filtered_ve_corrected_values,
+                afr_values=filtered_afr_values,
+            )
+
+            if predicted_ve is not None:
                 average_rpm_values.append(target_rpm)
-                average_ve_values.append(avg_ve)
-        
+                average_ve_values.append(predicted_ve)
+                average_afr_target_values.append(target_afr)
+
         if not average_rpm_values:
-            self.table_row_status.setText("Could not calculate averages from log data for this MAP.")
+            self.table_row_status.setText("Could not predict VE values from log data for this MAP.")
             return
-        
-        # Store the average data for display
+
+        skipped_points = len(rpm_bins) - len(average_rpm_values)
+
+        # Store the prediction data for display
         self.average_line_data = {
             "series_id": "average",
-            "name": "Average from Log",
+            "name": "Predicted VE",
             "rpm": average_rpm_values,
             "ve": average_ve_values,
             "map": [map_value] * len(average_rpm_values),
             "ve_raw": average_ve_values,
             "ve_scaled": average_ve_values,
             "afr": [None] * len(average_rpm_values),
-            "afr_target": [None] * len(average_rpm_values),
+            "afr_target": average_afr_target_values,
             "afr_error": [None] * len(average_rpm_values),
         }
-        
+
         self.table_row_status.setText(
-            f"Generated EGO-corrected average from {len(filtered_rpm)} log points near MAP {map_value} kPa."
+            f"Predicted VE from {len(filtered_rpm)} log points near MAP {map_value} kPa "
+            f"using AFR{'+ target' if afr_target_channel else ' (14.7 default target)'}; "
+            f"predicted {len(average_rpm_values)}/{len(rpm_bins)} row points"
+            f"{f', skipped {skipped_points} for low data' if skipped_points > 0 else ''}."
         )
         self.apply_average_to_row_button.setEnabled(True)
         self._update_table_grid_row_visualization()
+
 
     def _interpolate_average_value(self, x_points: list[float], y_points: list[float], target_x: float) -> float:
         if len(x_points) == 1:
@@ -2320,7 +2921,7 @@ class MainWindow(QMainWindow):
         return float(y_points[-1])
 
     def _on_row_editor_context_menu(self, pos) -> None:
-        """Show context menu on a row editor cell when average data is available for that RPM bin."""
+        """Show context menu on a row editor cell when prediction data is available for that RPM bin."""
         if self.average_line_data is None or self.current_x_axis is None:
             return
 
@@ -2342,7 +2943,7 @@ class MainWindow(QMainWindow):
 
         avg_value = avg_by_rpm[target_rpm]
         menu = QMenu(self)
-        apply_action = menu.addAction(f"Apply Average ({avg_value:.4g}) to This Cell")
+        apply_action = menu.addAction(f"Apply Prediction ({avg_value:.4g}) to This Cell")
         result = menu.exec(self.table_row_editor.viewport().mapToGlobal(pos))
         if result is apply_action:
             self._commit_pending_row_undo_state()
@@ -2358,13 +2959,13 @@ class MainWindow(QMainWindow):
             or self.current_table is None
             or "ve" not in self.current_table.name.lower()
         ):
-            self.table_row_status.setText("Generate an average line first.")
+            self.table_row_status.setText("Generate a predicted VE line first.")
             return
 
         avg_rpm_values = [float(v) for v in self.average_line_data.get("rpm", [])]
         avg_ve_values = [float(v) for v in self.average_line_data.get("ve", [])]
         if not avg_rpm_values or not avg_ve_values or len(avg_rpm_values) != len(avg_ve_values):
-            self.table_row_status.setText("Average line data is not available to apply.")
+            self.table_row_status.setText("Prediction data is not available to apply.")
             return
 
         # Build a lookup of RPM bins that actually have averaged data
@@ -2380,7 +2981,7 @@ class MainWindow(QMainWindow):
         self._refresh_table_row_editor()
         self._update_table_grid_row_visualization()
         applied_count = len(avg_rpm_values)
-        self.table_row_status.setText(f"Applied average to {applied_count} of {len(self.current_x_axis.values)} cells with log data. Click 'Write Row To Table Grid' to commit.")
+        self.table_row_status.setText(f"Applied predictions to {applied_count} of {len(self.current_x_axis.values)} cells with log data. Click 'Write Row To Table Grid' to commit.")
 
     def _update_table_grid_row_visualization(self) -> None:
         available, message = self._table_row_editing_available()
@@ -2390,20 +2991,31 @@ class MainWindow(QMainWindow):
 
         if self.current_table is not None and self._is_current_table_1d():
             table_type = self._row_table_type()
-            payload = self._build_1d_table_visualization_payload()
+            values_for_plot = [float(v) for v in self.pending_row_values] if self.pending_row_values else None
+            payload = self._build_1d_table_visualization_payload(values_for_plot)
+            dataset_key = ("1d", self.current_table.name)
+            auto_view_all = dataset_key != self._last_row_viz_dataset_key
+            payload["table_type"] = table_type
+            payload["cursor_x_label"] = str(payload.get("x_label", "X"))
+            payload["cursor_y_label"] = str(payload.get("y_label", "Value"))
             payload["available_series"] = self._row_viz_available_series(table_type, payload)
             payload["series_visibility"] = self.row_viz_preferences.get(table_type, {})
-            self.table_row_panel.set_row_data(payload)
-            self.table_row_label.setText("Selected row: n/a (1D table)")
-            self.table_row_editor.clear()
-            self.table_row_editor.setRowCount(1)
-            self.table_row_editor.setColumnCount(0)
-            self.table_row_editor.setEnabled(False)
+
+            selected_table_point_index = self.table_row_panel.selected_table_point_index()
+            self.table_row_panel.set_row_data(payload, auto_view_all=auto_view_all)
+            if not auto_view_all and selected_table_point_index is not None:
+                self.table_row_panel.select_table_point(selected_table_point_index)
+
+            self._last_row_viz_dataset_key = dataset_key
+            self.table_row_label.setText("Selected row: full 1D table")
             self.generate_average_button.setEnabled(False)
             self.apply_average_to_row_button.setEnabled(False)
-            self.apply_row_changes_button.setEnabled(False)
-            self.revert_row_changes_button.setEnabled(False)
-            self.table_row_status.setText(f"Viewing full 1D data for {self.current_table.name}. Selected-row editing is disabled.")
+            self.apply_row_changes_button.setEnabled(bool(self.pending_row_values))
+            self.revert_row_changes_button.setEnabled(bool(self.pending_row_values))
+            self.table_row_status.setText(
+                f"Editing full 1D table values for {self.current_table.name}. "
+                "Use scroll wheel, arrow keys, plot point selection, and Write Row To Table Grid."
+            )
             return
 
         if self.selected_table_row_idx is None or not self.pending_row_values:
@@ -2414,9 +3026,14 @@ class MainWindow(QMainWindow):
             self._clear_table_row_editor("Select a table row in the table grid to view and edit it.")
             return
 
+        dataset_key = ("2d", self.current_table.name, int(self.selected_table_row_idx))
+        auto_view_all = dataset_key != self._last_row_viz_dataset_key
+
         table_name = self.current_table.name.lower()
         table_type = self._row_table_type()
         map_value = float(self.current_y_axis.values[self.selected_table_row_idx])
+        cursor_x_label = self._axis_title("X", self.current_x_axis)
+        cursor_y_label = self._axis_title("Y", self.current_y_axis)
         if "knock" in table_name:
             payload = self._build_knock_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
         elif "afr" in table_name:
@@ -2425,7 +3042,7 @@ class MainWindow(QMainWindow):
             payload = self._build_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
             payload["y_label"] = "VE %"
         
-        # Add average line if it has been generated
+        # Add predicted VE line if it has been generated
         if self.average_line_data is not None and "ve" in table_name:
             point_sets = payload.get("point_sets", [])
             point_sets.append(self.average_line_data)
@@ -2433,11 +3050,53 @@ class MainWindow(QMainWindow):
 
         payload["available_series"] = self._row_viz_available_series(table_type, payload)
         payload["series_visibility"] = self.row_viz_preferences.get(table_type, {})
-        
-        self.table_row_panel.set_row_data(payload)
-        self.table_row_status.setText(
-            f"Editing MAP {map_value:g} kPa for {self.current_table.name}. Click 'Write Row To Table Grid' to commit changes."
-        )
+        payload["table_type"] = table_type
+        payload["cursor_x_label"] = cursor_x_label
+        payload["cursor_y_label"] = cursor_y_label
+
+        selected_table_point_index = self.table_row_panel.selected_table_point_index()
+        self.table_row_panel.set_row_data(payload, auto_view_all=auto_view_all)
+        if not auto_view_all and selected_table_point_index is not None:
+            self.table_row_panel.select_table_point(selected_table_point_index)
+        self._last_row_viz_dataset_key = dataset_key
+        status_message = f"Editing MAP {map_value:g} kPa for {self.current_table.name}. Click 'Write Row To Table Grid' to commit changes."
+        prediction_summary = self._current_editor_prediction_summary(payload)
+        if prediction_summary:
+            status_message = f"{status_message} {prediction_summary}"
+        self.table_row_status.setText(status_message)
+
+    def _current_editor_prediction_summary(self, payload: dict[str, Any]) -> str:
+        if self._row_table_type() != "ve":
+            return ""
+        if self.table_row_editor.columnCount() <= 0:
+            return ""
+        current_column = self.table_row_editor.currentColumn()
+        if current_column < 0:
+            return ""
+
+        table_series: dict[str, Any] | None = None
+        for series in payload.get("point_sets", []):
+            if isinstance(series, dict) and str(series.get("series_id")) == "table":
+                table_series = series
+                break
+        if table_series is None:
+            return ""
+
+        afr_predicted = None
+        afr_target = None
+        predicted_values = table_series.get("afr_predicted", [])
+        target_values = table_series.get("afr_target", [])
+        if isinstance(predicted_values, list) and 0 <= current_column < len(predicted_values):
+            afr_predicted = predicted_values[current_column]
+        if isinstance(target_values, list) and 0 <= current_column < len(target_values):
+            afr_target = target_values[current_column]
+
+        if afr_predicted is None and afr_target is None:
+            return ""
+
+        predicted_text = "n/a" if afr_predicted is None else f"{float(afr_predicted):.2f}"
+        target_text = "n/a" if afr_target is None else f"{float(afr_target):.2f}"
+        return f"Selected-cell AFR predicted: {predicted_text} | AFR target: {target_text}."
 
     def _table_row_editing_available(self) -> tuple[bool, str]:
         if not self.current_table or not self.current_x_axis or not self.current_y_axis:
@@ -2468,6 +3127,7 @@ class MainWindow(QMainWindow):
         self.apply_average_to_row_button.setEnabled(False)
         self.apply_row_changes_button.setEnabled(False)
         self.revert_row_changes_button.setEnabled(False)
+        self._last_row_viz_dataset_key = None
         self.table_row_panel.clear_visualization()
         self.table_row_status.setText(status_message)
 
@@ -2544,6 +3204,20 @@ class MainWindow(QMainWindow):
         if self.current_table is None or self.current_x_axis is None or self.current_y_axis is None:
             return
 
+        if self._is_current_table_1d():
+            self.selected_table_row_idx = 0
+            if self.current_table.rows == 1:
+                self.pending_row_values = [float(value) for value in self.current_table.values[0]]
+            else:
+                self.pending_row_values = [float(row[0]) for row in self.current_table.values]
+            self.row_default_values = [float(value) for value in self.pending_row_values]
+            self.row_edit_undo_stack = []
+            self.average_line_data = None
+            self.table_row_label.setText("Selected row: full 1D table")
+            self._refresh_table_row_editor()
+            self._update_table_grid_row_visualization()
+            return
+
         self.selected_table_row_idx = source_row
         self.pending_row_values = [float(value) for value in self.current_table.values[source_row]]
         self.row_default_values = [float(value) for value in self.pending_row_values]
@@ -2561,8 +3235,9 @@ class MainWindow(QMainWindow):
         self.table_row_editor.setColumnCount(len(self.pending_row_values))
         minimum, maximum = self._matrix_min_max([self.pending_row_values])
         span = max(maximum - minimum, 1e-9)
-        if self.current_x_axis is not None:
-            self.table_row_editor.setHorizontalHeaderLabels([f"{float(value):g}" for value in self.current_x_axis.values])
+        axis_values = self._active_row_editor_axis_values()
+        if axis_values and len(axis_values) == len(self.pending_row_values):
+            self.table_row_editor.setHorizontalHeaderLabels([f"{float(value):g}" for value in axis_values])
         for column_index, value in enumerate(self.pending_row_values):
             item = QTableWidgetItem(f"{value:g}")
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2635,10 +3310,13 @@ class MainWindow(QMainWindow):
         target_column: int | None = None
         if series_id == "table" and index is not None and 0 <= index < self.table_row_editor.columnCount():
             target_column = index
-        elif rpm_value is not None and self.current_x_axis is not None and self.current_x_axis.values:
+        elif rpm_value is not None:
+            axis_values = self._active_row_editor_axis_values()
+            if not axis_values:
+                return
             target_column = min(
-                range(len(self.current_x_axis.values)),
-                key=lambda i: abs(float(self.current_x_axis.values[i]) - float(rpm_value)),
+                range(len(axis_values)),
+                key=lambda i: abs(float(axis_values[i]) - float(rpm_value)),
             )
 
         if target_column is None or target_column < 0 or target_column >= self.table_row_editor.columnCount():
@@ -2646,6 +3324,12 @@ class MainWindow(QMainWindow):
 
         self.table_row_editor.setCurrentCell(0, target_column)
         self.table_row_editor.setFocus()
+
+    def _on_table_row_plot_point_adjust_requested(self, index: int, amount: float) -> None:
+        if index < 0 or index >= len(self.pending_row_values):
+            return
+        self.table_row_editor.setCurrentCell(0, index)
+        self._adjust_pending_row_value(index, amount)
 
     def _revert_pending_row_values(self) -> None:
         if not self.row_default_values:
@@ -2660,9 +3344,29 @@ class MainWindow(QMainWindow):
             self.current_table is None
             or self.current_x_axis is None
             or self.current_y_axis is None
-            or self.selected_table_row_idx is None
             or not self.pending_row_values
         ):
+            return
+
+        if self._is_current_table_1d():
+            if self.current_table.rows == 1:
+                if len(self.pending_row_values) != self.current_table.cols:
+                    return
+                self.current_table.values[0] = [float(value) for value in self.pending_row_values]
+            else:
+                if len(self.pending_row_values) != self.current_table.rows:
+                    return
+                for row_index, value in enumerate(self.pending_row_values):
+                    self.current_table.values[row_index][0] = float(value)
+
+            self.row_default_values = [float(value) for value in self.pending_row_values]
+            self.row_edit_undo_stack = []
+            self._render_table(self.current_table, self.current_x_axis, self.current_y_axis)
+            self._update_table_grid_row_visualization()
+            self.statusBar().showMessage(f"Updated 1D table values in {self.current_table.name}.")
+            return
+
+        if self.selected_table_row_idx is None:
             return
 
         self.current_table.values[self.selected_table_row_idx] = [float(value) for value in self.pending_row_values]
@@ -2721,11 +3425,43 @@ class MainWindow(QMainWindow):
         if tune_file.suffix.lower() != ".msq":
             return
 
+        tune_stem = tune_file.stem.lower()
         matching_logs: list[Path] = []
+        seen: set[Path] = set()
+
+        # 1) Prefer exact same-name logs next to the tune file.
         for suffix in (".msl", ".mlg"):
             candidate = tune_file.with_suffix(suffix)
             if candidate.exists():
-                matching_logs.append(candidate)
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    matching_logs.append(resolved)
+                    seen.add(resolved)
+
+        # 2) Include same-stem logs from recent log history.
+        for recent_log in self.recent_log_files:
+            resolved = recent_log.resolve()
+            if not resolved.exists():
+                continue
+            if resolved.suffix.lower() not in {".msl", ".mlg"}:
+                continue
+            if resolved.stem.lower() != tune_stem:
+                continue
+            if resolved not in seen:
+                matching_logs.append(resolved)
+                seen.add(resolved)
+
+        # 3) Include same-stem logs from default tuning data directory.
+        data_dir = self._default_data_dir()
+        if data_dir.exists():
+            for suffix in ("*.msl", "*.mlg"):
+                for candidate in data_dir.glob(suffix):
+                    resolved = candidate.resolve()
+                    if resolved.stem.lower() != tune_stem:
+                        continue
+                    if resolved not in seen:
+                        matching_logs.append(resolved)
+                        seen.add(resolved)
 
         if not matching_logs:
             return
@@ -2800,35 +3536,19 @@ class MainWindow(QMainWindow):
 
         file_path = Path(selected_path)
         
-        # Show progress dialog for large files
-        progress = QProgressBar()
-        progress.setRange(0, 0)  # Indeterminate progress
-        progress.setMinimumWidth(300)
-        
-        # Create a modal dialog with the progress bar
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel
-        progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("Loading Log File")
-        progress_dialog.setModal(True)
-        progress_dialog.setFixedSize(350, 100)
-        
-        layout = QVBoxLayout(progress_dialog)
-        layout.addWidget(QLabel(f"Loading {file_path.name}..."))
-        layout.addWidget(progress)
-        progress_dialog.show()
-        
-        # Force UI update
+        # Show wait cursor while loading
+        self.setCursor(Qt.CursorShape.WaitCursor)
         QGuiApplication.processEvents()
 
         try:
             parse_result = self.log_loader.load_log_with_report(file_path)
             log_df = parse_result.dataframe
         except Exception as exc:  # noqa: BLE001
-            progress_dialog.close()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             QMessageBox.critical(self, "Log Load Error", f"Could not load log file:\n{exc}")
             return
 
-        progress_dialog.close()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self.log_file = file_path
         self.statusBar().showMessage(
@@ -2927,6 +3647,14 @@ class MainWindow(QMainWindow):
         col_count = len(matrix[0]) if matrix else 0
         display_matrix = list(reversed(matrix))
         y_labels = list(reversed(self._header_labels(display_y_axis, row_count)))
+        if (
+            table.cols == 1
+            and table.rows > 1
+            and row_count == 1
+            and not self.transpose_checkbox.isChecked()
+            and not self.swap_axes_checkbox.isChecked()
+        ):
+            y_labels = ["Values"]
         x_labels = self._header_labels(display_x_axis, col_count)
         x_axis_title = self._axis_title("X", display_x_axis)
         y_axis_title = self._axis_title("Y", display_y_axis)
@@ -3020,6 +3748,20 @@ class MainWindow(QMainWindow):
         matrix = [row[:] for row in table.values]
         display_x_axis = x_axis
         display_y_axis = y_axis
+
+        # Default 1D column tables (Nx1) to horizontal presentation (1xN).
+        if table.cols == 1 and table.rows > 1:
+            matrix = [[float(row[0]) for row in matrix]]
+            display_x_axis = y_axis
+            display_y_axis = AxisVector(
+                name="index_y",
+                source_tag="synthetic",
+                length=1,
+                orientation="column",
+                units=None,
+                digits=None,
+                values=[1.0],
+            )
 
         if self.transpose_checkbox.isChecked():
             matrix = [list(col) for col in zip(*matrix)]
@@ -3129,6 +3871,93 @@ class MainWindow(QMainWindow):
         if coerced.notna().mean() >= 0.2:  # Lowered from 0.5 to 0.2 to accept columns with mixed data
             return coerced
         return None
+
+    @staticmethod
+    def _weighted_average(values: list[float], weights: list[float]) -> float | None:
+        if not values or not weights or len(values) != len(weights):
+            return None
+        total_weight = sum(weights)
+        if abs(total_weight) < 1e-12:
+            return None
+        return sum(v * w for v, w in zip(values, weights)) / total_weight
+
+    @staticmethod
+    def _predict_afr_from_neighbors(
+        target_rpm: float,
+        target_map: float,
+        target_ve: float,
+        rpm_values: list[float],
+        map_values: list[float],
+        ve_corrected_values: list[float],
+        afr_values: list[float | None],
+        neighbor_count: int = 24,
+    ) -> float | None:
+        if abs(target_ve) < 1e-9:
+            return None
+
+        candidates: list[tuple[float, float]] = []
+        for rpm, map_val, ve_corr, afr in zip(rpm_values, map_values, ve_corrected_values, afr_values):
+            if afr is None:
+                continue
+            if abs(float(ve_corr)) < 1e-9:
+                continue
+
+            rpm_dist = abs(float(rpm) - target_rpm) / 500.0
+            map_dist = abs(float(map_val) - target_map) / 10.0
+            distance = (rpm_dist * rpm_dist) + (map_dist * map_dist)
+            afr_predicted = float(afr) * (float(ve_corr) / target_ve)
+            candidates.append((distance, afr_predicted))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        selected = candidates[: max(1, neighbor_count)]
+        predicted_values = [value for _, value in selected]
+        weights = [1.0 / (distance + 0.05) for distance, _ in selected]
+        return MainWindow._weighted_average(predicted_values, weights)
+
+    @staticmethod
+    def _predict_ve_from_neighbors(
+        target_rpm: float,
+        target_map: float,
+        target_afr: float,
+        rpm_values: list[float],
+        map_values: list[float],
+        ve_corrected_values: list[float],
+        afr_values: list[float | None],
+        neighbor_count: int = 24,
+        min_neighbors: int = 4,
+        max_distance: float = 6.0,
+    ) -> float | None:
+        """Predict the VE needed to achieve target_afr using EGO-corrected log VE and actual AFR neighbors."""
+        if abs(target_afr) < 1e-9:
+            return None
+
+        candidates: list[tuple[float, float]] = []
+        for rpm, map_val, ve_corr, afr in zip(rpm_values, map_values, ve_corrected_values, afr_values):
+            if afr is None or abs(float(afr)) < 1e-9 or abs(float(ve_corr)) < 1e-9:
+                continue
+            rpm_dist = abs(float(rpm) - target_rpm) / 500.0
+            map_dist = abs(float(map_val) - target_map) / 10.0
+            distance = (rpm_dist * rpm_dist) + (map_dist * map_dist)
+            # Scale EGO-corrected VE by actual/target AFR ratio to predict VE needed for target AFR
+            ve_predicted = float(ve_corr) * (float(afr) / target_afr)
+            candidates.append((distance, ve_predicted))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        selected = candidates[: max(1, neighbor_count)]
+        close_selected = [item for item in selected if item[0] <= max_distance]
+        if len(close_selected) < max(1, min_neighbors):
+            return None
+
+        selected = close_selected
+        predicted_values = [value for _, value in selected]
+        weights = [1.0 / (distance + 0.05) for distance, _ in selected]
+        return MainWindow._weighted_average(predicted_values, weights)
 
     @staticmethod
     def _default_data_dir() -> Path:

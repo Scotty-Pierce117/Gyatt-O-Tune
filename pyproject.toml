@@ -1,6 +1,6 @@
 [project]
 name = "gyatt-o-tune"
-version = "0.1.0"
+version = "0.1.2"
 description = "MegaSquirt tune and log analysis desktop app"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,4 +31,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-gyatt_o_tune = ["assets/*.svg"]
+gyatt_o_tune = ["assets/*.svg", "assets/*.ico"]

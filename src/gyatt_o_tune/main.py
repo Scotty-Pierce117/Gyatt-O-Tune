@@ -16,17 +16,25 @@ def _asset_path(filename: str) -> Path:
     return Path(__file__).resolve().parent / "assets" / filename
 
 
+def _resolve_window_icon_path() -> Path | None:
+    for candidate in ("gyatt-o-tune.ico", "gyatt-o-tune.svg"):
+        path = _asset_path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Gyatt-O-Tune")
 
-    icon_path = _asset_path("gyatt-o-tune.svg")
-    if icon_path.exists():
+    icon_path = _resolve_window_icon_path()
+    if icon_path is not None:
         app_icon = QIcon(str(icon_path))
         app.setWindowIcon(app_icon)
 
     window = MainWindow()
-    if icon_path.exists():
+    if icon_path is not None:
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
 
