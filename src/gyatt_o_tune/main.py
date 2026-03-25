@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -41,8 +42,9 @@ def main() -> int:
     if len(sys.argv) > 1:
         tune_path = Path(sys.argv[1])
         if tune_path.is_file():
-            from PySide6.QtCore import QTimer
             QTimer.singleShot(0, lambda: window._open_recent_tune_file(tune_path))
+    else:
+        QTimer.singleShot(0, window._show_startup_tune_dialog)
 
     return app.exec()
 

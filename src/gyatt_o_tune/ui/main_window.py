@@ -6,7 +6,7 @@ from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -1076,6 +1076,83 @@ class RowVisualizationPreferencesDialog(QDialog):
         return updated
 
 
+class StartupTuneDialog(QDialog):
+    """Startup picker for quickly loading a recent tune."""
+
+    def __init__(self, recent_tune_files: list[Path], window_icon: QIcon, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to Gyatt-O-Tune")
+        self.setModal(True)
+        self.resize(540, 420)
+
+        self.selected_tune_path: Path | None = None
+        has_recent_tunes = False
+
+        layout = QVBoxLayout(self)
+
+        icon_label = QLabel()
+        if not window_icon.isNull():
+            icon_label.setPixmap(window_icon.pixmap(72, 72))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(icon_label)
+
+        title = QLabel("Load a recent tune")
+        title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(title)
+
+        subtitle = QLabel("Choose a recent tune to continue, or start with an empty workspace.")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        self.recent_list = QListWidget()
+        for file_path in recent_tune_files:
+            if not file_path.exists():
+                continue
+            item = QListWidgetItem(file_path.name)
+            item.setData(Qt.ItemDataRole.UserRole, str(file_path))
+            item.setToolTip(str(file_path))
+            self.recent_list.addItem(item)
+            has_recent_tunes = True
+
+        if not has_recent_tunes:
+            placeholder = QListWidgetItem("No recent tune files found")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.recent_list.addItem(placeholder)
+
+        self.recent_list.itemDoubleClicked.connect(self._open_selected)
+        layout.addWidget(self.recent_list, 1)
+
+        button_row = QHBoxLayout()
+        self.open_button = QPushButton("Open Selected Tune")
+        self.open_button.clicked.connect(self._open_selected)
+        self.open_button.setEnabled(has_recent_tunes)
+        button_row.addWidget(self.open_button)
+
+        start_empty = QPushButton("Start Empty")
+        start_empty.clicked.connect(self.reject)
+        button_row.addWidget(start_empty)
+        layout.addLayout(button_row)
+
+    def _open_selected(self, _item: QListWidgetItem | None = None) -> None:
+        current_item = self.recent_list.currentItem()
+        if current_item is None:
+            QMessageBox.information(self, "Select a Tune", "Choose a recent tune file to continue.")
+            return
+
+        path_str = current_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(path_str, str):
+            return
+
+        selected = Path(path_str)
+        if not selected.exists():
+            QMessageBox.warning(self, "File Not Found", f"The file {selected} no longer exists.")
+            return
+
+        self.selected_tune_path = selected
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     MAX_RECENT_FILES = 10
     WINDOW_GEOMETRY_KEY = "main_window_geometry"
@@ -1101,7 +1178,6 @@ class MainWindow(QMainWindow):
         self.tune_data: TuneData | None = None
         self.loaded_tune_path: Path | None = None
         self.save_target_path: Path | None = None
-        self.save_tune_action: Any | None = None
         self.save_tune_as_action: Any | None = None
         self.log_file: Path | None = None
         self.log_df: Any | None = None
@@ -1177,12 +1253,8 @@ class MainWindow(QMainWindow):
         load_matching_log_shortcut_action.triggered.connect(self._on_load_matching_log_shortcut)
         self.addAction(load_matching_log_shortcut_action)
 
-        self.save_tune_action = file_menu.addAction("&Save")
-        self.save_tune_action.setShortcut(QKeySequence("Ctrl+S"))
-        self.save_tune_action.triggered.connect(self._save_tune_revision)
-        self.save_tune_action.setEnabled(False)
-
         self.save_tune_as_action = file_menu.addAction("Save Tune &As...")
+        self.save_tune_as_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_tune_as_action.triggered.connect(self._save_tune_as)
         self.save_tune_as_action.setEnabled(False)
 
@@ -1236,8 +1308,6 @@ class MainWindow(QMainWindow):
         self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
 
     def _set_tune_save_actions_enabled(self, enabled: bool) -> None:
-        if self.save_tune_action is not None:
-            self.save_tune_action.setEnabled(enabled)
         if self.save_tune_as_action is not None:
             self.save_tune_as_action.setEnabled(enabled)
 
@@ -2199,13 +2269,14 @@ class MainWindow(QMainWindow):
             action.setToolTip(str(file_path))
             action.triggered.connect(lambda checked, path=file_path: self._open_recent_log_file(path))
 
-    def _open_recent_tune_file(self, file_path: Path) -> None:
+    def _open_recent_tune_file(self, file_path: Path) -> bool:
         if not file_path.exists():
             QMessageBox.warning(self, "File Not Found", f"The file {file_path} no longer exists.")
-            self.recent_tune_files.remove(file_path)
+            if file_path in self.recent_tune_files:
+                self.recent_tune_files.remove(file_path)
             self._save_recent_files()
             self._update_recent_tunes_menu()
-            return
+            return False
 
         try:
             self.tune_data = self.tune_loader.load(file_path)
@@ -2215,7 +2286,7 @@ class MainWindow(QMainWindow):
             self._clear_global_history()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Tune Load Error", f"Could not load tune file:\n{exc}")
-            return
+            return False
 
         self.loaded_tune_path = file_path
         self.save_target_path = None
@@ -2237,16 +2308,30 @@ class MainWindow(QMainWindow):
         self._refresh_workspace_text()
         self._add_recent_tune_file(file_path)
         self._maybe_prompt_load_matching_log(file_path)
+        return True
+
+    def _show_startup_tune_dialog(self) -> None:
+        dialog = StartupTuneDialog(self.recent_tune_files, self.windowIcon(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_path = dialog.selected_tune_path
+        if selected_path is None:
+            return
+
+        if self._open_recent_tune_file(selected_path):
+            self._load_default_window_layout()
 
     def _open_recent_log_file(self, file_path: Path) -> None:
         if not file_path.exists():
             QMessageBox.warning(self, "File Not Found", f"The file {file_path} no longer exists.")
-            self.recent_log_files.remove(file_path)
+            if file_path in self.recent_log_files:
+                self.recent_log_files.remove(file_path)
             self._save_recent_files()
             self._update_recent_logs_menu()
             return
 
-        # Show wait cursor while loading
+        self.statusBar().showMessage(f"Loading log: {file_path.name}...")
         self.setCursor(Qt.CursorShape.WaitCursor)
         QGuiApplication.processEvents()
 
@@ -2254,11 +2339,11 @@ class MainWindow(QMainWindow):
             parse_result = self.log_loader.load_log_with_report(file_path)
             log_df = parse_result.dataframe
         except Exception as exc:  # noqa: BLE001
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.statusBar().showMessage(f"Failed to load log: {file_path.name}", 5000)
             QMessageBox.critical(self, "Log Load Error", f"Could not load log file:\n{exc}")
             return
-
-        self.setCursor(Qt.CursorShape.ArrowCursor)
+        finally:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self.log_file = file_path
         self.statusBar().showMessage(
@@ -4337,18 +4422,6 @@ class MainWindow(QMainWindow):
         dest = Path(dest_path)
         self._save_tune_to_path(dest)
 
-    def _save_tune_revision(self) -> None:
-        if self.tune_data is None or self.loaded_tune_path is None:
-            QMessageBox.warning(self, "No Tune Loaded", "Load a tune file before saving.")
-            return
-
-        if self.save_target_path is None:
-            # First save after loading a tune behaves like Save As.
-            self._save_tune_as()
-            return
-
-        self._save_tune_to_path(self.save_target_path)
-
     def _save_tune_to_path(self, dest: Path) -> None:
         if self.tune_data is None:
             QMessageBox.warning(self, "No Tune Loaded", "Load a tune file before saving.")
@@ -4402,8 +4475,7 @@ class MainWindow(QMainWindow):
             return
 
         file_path = Path(selected_path)
-        
-        # Show wait cursor while loading
+        self.statusBar().showMessage(f"Loading log: {file_path.name}...")
         self.setCursor(Qt.CursorShape.WaitCursor)
         QGuiApplication.processEvents()
 
@@ -4411,11 +4483,11 @@ class MainWindow(QMainWindow):
             parse_result = self.log_loader.load_log_with_report(file_path)
             log_df = parse_result.dataframe
         except Exception as exc:  # noqa: BLE001
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.statusBar().showMessage(f"Failed to load log: {file_path.name}", 5000)
             QMessageBox.critical(self, "Log Load Error", f"Could not load log file:\n{exc}")
             return
-
-        self.setCursor(Qt.CursorShape.ArrowCursor)
+        finally:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self.log_file = file_path
         self.statusBar().showMessage(
