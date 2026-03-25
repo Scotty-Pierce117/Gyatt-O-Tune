@@ -6,10 +6,11 @@ from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QColor, QGuiApplication, QKeySequence
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDockWidget,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -24,11 +25,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +43,9 @@ class CopyPasteTableWidget(QTableWidget):
     def __init__(self) -> None:
         super().__init__()
         self.footer_rows = 0
+        self.on_adjust_value: Any = None
+        self.on_undo: Any = None
+        self.on_redo: Any = None
 
     def set_footer_rows(self, count: int) -> None:
         self.footer_rows = max(0, count)
@@ -51,6 +54,27 @@ class CopyPasteTableWidget(QTableWidget):
         return max(0, self.rowCount() - self.footer_rows)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        current_row = self.currentRow()
+        current_column = self.currentColumn()
+        in_data_region = (
+            current_row >= 0
+            and current_column >= 0
+            and current_row < self._data_row_count()
+            and current_column < self.columnCount()
+        )
+
+        if event.matches(QKeySequence.StandardKey.Undo) and in_data_region and callable(self.on_undo):
+            self.on_undo(current_row, current_column)
+            return
+        if event.matches(QKeySequence.StandardKey.Redo) and in_data_region and callable(self.on_redo):
+            self.on_redo(current_row, current_column)
+            return
+        if event.key() == Qt.Key.Key_Up and in_data_region and callable(self.on_adjust_value):
+            self.on_adjust_value(current_row, current_column, 0.1)
+            return
+        if event.key() == Qt.Key.Key_Down and in_data_region and callable(self.on_adjust_value):
+            self.on_adjust_value(current_row, current_column, -0.1)
+            return
         if event.matches(QKeySequence.StandardKey.Copy):
             self.copy_selection()
             return
@@ -58,6 +82,30 @@ class CopyPasteTableWidget(QTableWidget):
             self.paste_selection()
             return
         super().keyPressEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        current_row = self.currentRow()
+        current_column = self.currentColumn()
+        in_data_region = (
+            current_row >= 0
+            and current_column >= 0
+            and current_row < self._data_row_count()
+            and current_column < self.columnCount()
+        )
+        if not in_data_region or not callable(self.on_adjust_value):
+            super().wheelEvent(event)
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+
+        steps = max(1, abs(delta) // 120)
+        increment = 0.5 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 0.1
+        amount = float(steps * increment if delta > 0 else -steps * increment)
+        self.on_adjust_value(current_row, current_column, amount)
+        event.accept()
 
     def copy_selection(self) -> None:
         selected_ranges = self.selectedRanges()
@@ -103,10 +151,58 @@ class CopyPasteTableWidget(QTableWidget):
                 existing.setText(value.strip())
 
 
+class TuneTablesListWidget(QListWidget):
+    """Tune table list that accepts dropped tune files for quick loading."""
+
+    ALLOWED_TUNE_SUFFIXES = {".msq", ".ini", ".txt"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_tune_file_dropped: Any = None
+        self.setAcceptDrops(True)
+
+    def _first_valid_tune_path(self, event: Any) -> Path | None:
+        mime_data = event.mimeData()
+        if not mime_data.hasUrls():
+            return None
+
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if not path.is_file():
+                continue
+            if path.suffix.lower() in self.ALLOWED_TUNE_SUFFIXES:
+                return path
+        return None
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if self._first_valid_tune_path(event) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._first_valid_tune_path(event) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        tune_path = self._first_valid_tune_path(event)
+        if tune_path is None:
+            super().dropEvent(event)
+            return
+
+        if callable(self.on_tune_file_dropped):
+            self.on_tune_file_dropped(tune_path)
+        event.acceptProposedAction()
+
+
 class RowVisualizationPanel(QGroupBox):
     """Reusable row data visualization with crosshair and point selection."""
 
-    def __init__(self, title: str = "Row Data Visualization") -> None:
+    def __init__(self, title: str = "") -> None:
         super().__init__(title)
         self._selected_point: tuple[str, int] | None = None
         self._point_sets: list[dict[str, Any]] = []
@@ -116,6 +212,8 @@ class RowVisualizationPanel(QGroupBox):
         self.legend: Any = None
         self._table_type = "generic"
         self._y_label_text = "Value"
+        self._selected_point_text = "<span style='color:#f0f0f0'>Selected point: none</span>"
+        self._stats_tooltip_text = ""
         
         # Visibility toggles for different data series
         self._show_table = True
@@ -128,6 +226,11 @@ class RowVisualizationPanel(QGroupBox):
         self._show_knock = True
 
         layout = QVBoxLayout(self)
+
+        self.graph_title_label = QLabel("No data selected")
+        self.graph_title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.graph_title_label.setToolTip("")
+        layout.addWidget(self.graph_title_label)
 
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.2)
@@ -150,10 +253,18 @@ class RowVisualizationPanel(QGroupBox):
             size=11,
             name="Selected Point",
         )
+        self.selected_point_overlay = pg.TextItem(
+            anchor=(1, 0),
+            color=(240, 240, 240),
+        )
         self.crosshair_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(200, 200, 200, 140, width=1))
         self.crosshair_hline = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(200, 200, 200, 140, width=1))
 
-        layout.addWidget(self.plot)
+        layout.addWidget(self.plot, 1)
+
+        view_box = self.plot.getPlotItem().vb
+        if view_box is not None:
+            view_box.sigRangeChanged.connect(self._on_plot_range_changed)
         
         # Add toggle controls for each data series
         toggle_layout = QHBoxLayout()
@@ -213,29 +324,6 @@ class RowVisualizationPanel(QGroupBox):
         toggle_layout.addStretch()
         layout.addLayout(toggle_layout)
 
-        self.bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        left_bottom_widget = QWidget()
-        left_bottom_layout = QVBoxLayout(left_bottom_widget)
-        left_bottom_layout.setContentsMargins(0, 0, 0, 0)
-        self.selected_point_label = QLabel("Selected point: none")
-        self.selected_point_label.setWordWrap(True)
-        left_bottom_layout.addWidget(self.selected_point_label)
-        left_bottom_layout.addStretch(1)
-
-        right_bottom_widget = QWidget()
-        right_bottom_layout = QVBoxLayout(right_bottom_widget)
-        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
-        self.stats_text = QTextEdit()
-        self.stats_text.setReadOnly(True)
-        right_bottom_layout.addWidget(self.stats_text)
-
-        self.bottom_splitter.addWidget(left_bottom_widget)
-        self.bottom_splitter.addWidget(right_bottom_widget)
-        self.bottom_splitter.setSizes([500, 500])
-        self.bottom_splitter.setMaximumHeight(140)
-        layout.addWidget(self.bottom_splitter)
-
         self._mouse_proxy = pg.SignalProxy(
             self.plot.scene().sigMouseMoved,
             rateLimit=30,
@@ -246,6 +334,31 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.installEventFilter(self)
         self.plot.viewport().installEventFilter(self)
         self.clear_visualization()
+
+    def _set_graph_title(self, title: str, stats_text: str = "") -> None:
+        self.graph_title_label.setText(title)
+        self._stats_tooltip_text = stats_text
+        self.graph_title_label.setToolTip(stats_text)
+
+    def _set_selected_point_text(self, html: str) -> None:
+        self._selected_point_text = html
+        self.selected_point_overlay.setHtml(html)
+        self._position_selected_point_overlay()
+
+    def _position_selected_point_overlay(self) -> None:
+        plot_item = self.plot.getPlotItem()
+        if plot_item is None:
+            return
+        view_box = plot_item.vb
+        if view_box is None:
+            return
+        (x_min, x_max), (y_min, y_max) = view_box.viewRange()
+        x_padding = (x_max - x_min) * 0.02
+        y_padding = (y_max - y_min) * 0.02
+        self.selected_point_overlay.setPos(x_max - x_padding, y_max - y_padding)
+
+    def _on_plot_range_changed(self, *args: Any) -> None:
+        self._position_selected_point_overlay()
 
     def eventFilter(self, watched: Any, event: Any) -> bool:  # type: ignore[override]
         if watched in {self.plot, self.plot.viewport()}:
@@ -422,11 +535,10 @@ class RowVisualizationPanel(QGroupBox):
         self._y_label_text = "Value"
         self._remove_legend()
         self.plot.clear()
-        self.plot.setTitle(title)
+        self._set_graph_title(title, stats_text)
         self.plot.setLabel('left', self._y_label_text)
         self.plot.setLabel('bottom', 'RPM')
-        self.stats_text.setPlainText(stats_text)
-        self.selected_point_label.setText("Selected point: none")
+        self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
         self._add_plot_items()
         self._apply_view_all()
 
@@ -441,11 +553,10 @@ class RowVisualizationPanel(QGroupBox):
         self.configure_series_controls(available_series, preferred_visibility)
         self._remove_legend()
         self.plot.clear()
-        self.plot.setTitle(str(payload.get("title", "Row Data Visualization")))
+        self._set_graph_title(str(payload.get("title", "")), str(payload.get("stats", "")))
         self.plot.setLabel('left', self._y_label_text)
         self.plot.setLabel('bottom', x_label_text)
-        self.stats_text.setPlainText(str(payload.get("stats", "")))
-        self.selected_point_label.setText("Selected point: none")
+        self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
         self._add_plot_items()
         self._refresh_point_styles()
         self._refresh_visibility()
@@ -473,11 +584,13 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.addItem(self.afr_error_scatter)
         self.plot.addItem(self.knock_scatter)
         self.plot.addItem(self.selected_marker)
+        self.plot.addItem(self.selected_point_overlay, ignoreBounds=True)
         self.plot.addItem(self.crosshair_vline, ignoreBounds=True)
         self.plot.addItem(self.crosshair_hline, ignoreBounds=True)
         self.selected_marker.hide()
         self.crosshair_vline.hide()
         self.crosshair_hline.hide()
+        self._set_selected_point_text(self._selected_point_text)
 
         self._apply_item_z_order()
         self._remove_legend()
@@ -512,6 +625,7 @@ class RowVisualizationPanel(QGroupBox):
         self.selected_marker.setZValue(40)
         self.table_scatter.setZValue(32)
         self.selected_marker.setZValue(40)
+        self.selected_point_overlay.setZValue(65)
         self.crosshair_vline.setZValue(60)
         self.crosshair_hline.setZValue(60)
 
@@ -647,9 +761,14 @@ class RowVisualizationPanel(QGroupBox):
 
         self._selected_point = ("table", index)
         self._refresh_point_styles()
-        self.selected_point_label.setText(self._format_selected_point_text(table_series, index))
+        self._set_selected_point_text(self._format_selected_point_text(table_series, index))
         if emit_callback and callable(self.on_point_selected):
             self.on_point_selected("table", index, float(rpm_values[index]))
+
+    def clear_selected_point(self) -> None:
+        self._selected_point = None
+        self._refresh_point_styles()
+        self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
 
     @staticmethod
     def _format_value(value: float | None, suffix: str = "") -> str:
@@ -680,38 +799,50 @@ class RowVisualizationPanel(QGroupBox):
         startup_enrichment = value_at("startup_enrichment")
         ignition_advance = value_at("ignition_advance")
 
-        lines = [
-            f"Selected point ({name})",
-            f"RPM {rpm:.1f} | MAP {map_val:.1f} kPa",
+        lines = [f"Selected point ({name})"]
+        detail_rows: list[tuple[str, str]] = [
+            ("RPM:", f"{rpm:.1f}"),
+            ("MAP:", f"{map_val:.1f} kPa"),
         ]
         series_id = str(series.get("series_id"))
         if series_id == "corrected":
             if self._table_type == "ve" and ve_scaled is not None and ve_raw is not None and abs(float(ve_raw)) > 1e-9:
                 ve_offset_pct = ((float(ve_scaled) - float(ve_raw)) / float(ve_raw)) * 100.0
-                lines.append(f"Offset vs Raw VE: {ve_offset_pct:+.2f}%")
-            lines.append(f"VE scaled: {self._format_value(ve_scaled, '%')}")
-            lines.append(f"VE unscaled: {self._format_value(ve_raw, '%')}")
+                detail_rows.append(("Offset vs Raw VE:", f"{ve_offset_pct:+.2f}%"))
+            detail_rows.append(("VE scaled:", self._format_value(ve_scaled, '%')))
+            detail_rows.append(("VE unscaled:", self._format_value(ve_raw, '%')))
         elif series_id == "table":
-            lines.append(f"Selected row value: {ve:.2f}")
+            detail_rows.append(("Selected row value:", f"{ve:.2f}"))
             if afr_predicted is not None:
-                lines.append(f"AFR predicted: {self._format_value(afr_predicted)}")
+                detail_rows.append(("AFR predicted:", self._format_value(afr_predicted)))
         elif series_id in {"afr", "afr_target", "afr_error", "knock"}:
-            lines.append(f"Value: {ve:.2f}")
+            detail_rows.append(("Value:", f"{ve:.2f}"))
         else:
-            lines.append(f"VE: {ve:.2f}%")
-        lines.append(f"AFR Actual: {self._format_value(afr)}")
-        lines.append(f"AFR target: {self._format_value(afr_target)}")
-        lines.append(f"AFR error: {self._format_value(afr_error)}")
+            detail_rows.append(("VE:", f"{ve:.2f}%"))
+        detail_rows.append(("AFR Actual:", self._format_value(afr)))
+        detail_rows.append(("AFR target:", self._format_value(afr_target)))
+        detail_rows.append(("AFR error:", self._format_value(afr_error)))
         if series_id == "knock":
-            lines.append(f"Time elapsed: {self._format_value(time_elapsed, ' s')}")
+            detail_rows.append(("Time elapsed:", self._format_value(time_elapsed, ' s')))
             if cranking_status is None:
-                lines.append("Cranking status: n/a")
+                detail_rows.append(("Cranking status:", "n/a"))
             else:
-                lines.append(f"Cranking status: {'On' if float(cranking_status) >= 0.5 else 'Off'}")
-            lines.append(f"Warm-up enrichment: {self._format_value(warmup_enrichment, '%')}")
-            lines.append(f"Start-up enrichment: {self._format_value(startup_enrichment, '%')}")
-            lines.append(f"Ignition advance: {self._format_value(ignition_advance, ' deg')}")
-        return "\n".join(lines)
+                detail_rows.append(("Cranking status:", "On" if float(cranking_status) >= 0.5 else "Off"))
+            detail_rows.append(("Warm-up enrichment:", self._format_value(warmup_enrichment, '%')))
+            detail_rows.append(("Start-up enrichment:", self._format_value(startup_enrichment, '%')))
+            detail_rows.append(("Ignition advance:", self._format_value(ignition_advance, ' deg')))
+
+        rows_html = "".join(
+            f"<tr><td style='padding-right:10px'>{label}</td><td>{value}</td></tr>"
+            for label, value in detail_rows
+        )
+        header = lines[0] if lines else ""
+        return (
+            f"<span style='color:#f0f0f0'>"
+            f"<b>{header}</b><br>"
+            f"<table cellpadding='0' cellspacing='2'>{rows_html}</table>"
+            f"</span>"
+        )
 
     def _on_mouse_moved(self, evt: tuple[Any]) -> None:
         if not evt:
@@ -775,7 +906,7 @@ class RowVisualizationPanel(QGroupBox):
         if nearest is None or nearest[0] > max_pick_distance_squared:
             self._selected_point = None
             self._refresh_point_styles()
-            self.selected_point_label.setText("Selected point: none")
+            self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
             if callable(self.on_point_selected):
                 self.on_point_selected(None, None, None)
             return
@@ -787,7 +918,7 @@ class RowVisualizationPanel(QGroupBox):
 
         self._selected_point = (series_id, index)
         self._refresh_point_styles()
-        self.selected_point_label.setText(self._format_selected_point_text(selected_series, index))
+        self._set_selected_point_text(self._format_selected_point_text(selected_series, index))
         rpm_value = None
         rpm_values = selected_series.get("rpm", [])
         if index < len(rpm_values):
@@ -803,17 +934,40 @@ class RowEditorTableWidget(QTableWidget):
         super().__init__()
         self.on_adjust_value: Any = None
         self.on_undo: Any = None
+        self.on_redo: Any = None
+        self.on_focus_changed: Any = None
         self.setRowCount(1)
         self.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
         self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.verticalHeader().setVisible(False)
+        self.horizontalHeader().setSectionsClickable(True)
+        self.horizontalHeader().sectionClicked.connect(self._on_header_section_clicked)
+
+    def _on_header_section_clicked(self, section: int) -> None:
+        if 0 <= section < self.columnCount():
+            self.setCurrentCell(0, section)
+            self.setFocus()
+
+    def focusInEvent(self, event) -> None:  # type: ignore[override]
+        super().focusInEvent(event)
+        if callable(self.on_focus_changed):
+            self.on_focus_changed(True)
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        super().focusOutEvent(event)
+        if callable(self.on_focus_changed):
+            self.on_focus_changed(False)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         current_column = self.currentColumn()
         if event.matches(QKeySequence.StandardKey.Undo):
             if callable(self.on_undo):
                 self.on_undo(current_column)
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            if callable(self.on_redo):
+                self.on_redo(current_column)
             return
         if event.key() == Qt.Key.Key_Left:
             if current_column > 0:
@@ -924,6 +1078,11 @@ class RowVisualizationPreferencesDialog(QDialog):
 
 class MainWindow(QMainWindow):
     MAX_RECENT_FILES = 10
+    WINDOW_GEOMETRY_KEY = "main_window_geometry"
+    WINDOW_DOCK_STATE_KEY = "main_window_dock_state_v2"
+    DEFAULT_WINDOW_GEOMETRY_KEY = "default_main_window_geometry_v1"
+    DEFAULT_WINDOW_DOCK_STATE_KEY = "default_main_window_dock_state_v1"
+    OPEN_TUNE_PLACEHOLDER_KEY = "__open_tune_file__"
     ROW_VIZ_SERIES_BY_TABLE_TYPE: dict[str, list[str]] = {
         "ve": ["table", "raw", "corrected", "average"],
         "afr": ["table", "afr", "afr_target", "afr_error"],
@@ -941,6 +1100,8 @@ class MainWindow(QMainWindow):
 
         self.tune_data: TuneData | None = None
         self.loaded_tune_path: Path | None = None
+        self.save_target_path: Path | None = None
+        self.save_tune_action: Any | None = None
         self.save_tune_as_action: Any | None = None
         self.log_file: Path | None = None
         self.log_df: Any | None = None
@@ -951,10 +1112,21 @@ class MainWindow(QMainWindow):
         self.pending_row_values: list[float] = []
         self.row_default_values: list[float] = []
         self.row_edit_undo_stack: list[list[float]] = []
+        self._active_row_edit_column: int | None = None
+        self._active_row_edit_snapshot: list[float] | None = None
+        self.global_undo_stack: list[dict[str, Any]] = []
+        self.global_redo_stack: list[dict[str, Any]] = []
+        self._history_is_applying = False
+        self.undo_action: QAction | None = None
+        self.redo_action: QAction | None = None
         self.average_line_data: dict[str, Any] | None = None
         self._last_row_viz_dataset_key: tuple[Any, ...] | None = None
+        self.loaded_table_snapshots: dict[str, list[list[float]]] = {}
         self.selected_rows_per_table: dict[str, int] = {}  # Track selected row for each table
-        self.pending_edits_per_table: dict[str, dict] = {}  # Track unsaved edits per table
+        self.pending_edits_per_table: dict[str, dict] = {}  # Track unsaved edits by table and row
+        self._row_viz_refresh_timer = QTimer(self)
+        self._row_viz_refresh_timer.setSingleShot(True)
+        self._row_viz_refresh_timer.timeout.connect(self._apply_deferred_row_visualization_update)
 
         self.recent_tune_files: list[Path] = []
         self.recent_log_files: list[Path] = []
@@ -976,6 +1148,7 @@ class MainWindow(QMainWindow):
         self._create_menu()
         self._create_layout()
         self.setStatusBar(QStatusBar())
+        QTimer.singleShot(0, self._restore_dock_layout)
         self.statusBar().showMessage("Ready")
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
@@ -994,13 +1167,20 @@ class MainWindow(QMainWindow):
         self.recent_tunes_menu = file_menu.addMenu("Recent &Tune Files")
         self._update_recent_tunes_menu()
 
-        load_recent_tune_action = file_menu.addAction("Load Most Recent Tune")
-        load_recent_tune_action.setShortcut(QKeySequence("Ctrl+T"))
-        load_recent_tune_action.triggered.connect(self._on_load_most_recent_tune_shortcut)
+        load_recent_tune_shortcut_action = QAction(self)
+        load_recent_tune_shortcut_action.setShortcut(QKeySequence("Ctrl+T"))
+        load_recent_tune_shortcut_action.triggered.connect(self._on_load_most_recent_tune_shortcut)
+        self.addAction(load_recent_tune_shortcut_action)
 
-        load_matching_log_action = file_menu.addAction("Load Matching Log File")
-        load_matching_log_action.setShortcut(QKeySequence("Ctrl+L"))
-        load_matching_log_action.triggered.connect(self._on_load_matching_log_shortcut)
+        load_matching_log_shortcut_action = QAction(self)
+        load_matching_log_shortcut_action.setShortcut(QKeySequence("Ctrl+L"))
+        load_matching_log_shortcut_action.triggered.connect(self._on_load_matching_log_shortcut)
+        self.addAction(load_matching_log_shortcut_action)
+
+        self.save_tune_action = file_menu.addAction("&Save")
+        self.save_tune_action.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_tune_action.triggered.connect(self._save_tune_revision)
+        self.save_tune_action.setEnabled(False)
 
         self.save_tune_as_action = file_menu.addAction("Save Tune &As...")
         self.save_tune_as_action.triggered.connect(self._save_tune_as)
@@ -1017,32 +1197,401 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
 
         edit_menu = self.menuBar().addMenu("&Edit")
+        self.undo_action = edit_menu.addAction("&Undo")
+        self.undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        self.undo_action.triggered.connect(self._trigger_global_undo)
+        self.undo_action.setEnabled(False)
+
+        self.redo_action = edit_menu.addAction("&Redo")
+        self.redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
+        self.redo_action.triggered.connect(self._trigger_global_redo)
+        self.redo_action.setEnabled(False)
+
+        edit_menu.addSeparator()
         preferences_action = edit_menu.addAction("&Preferences...")
         preferences_action.triggered.connect(self._open_preferences)
 
-        view_menu = self.menuBar().addMenu("&View")
-        self.tunerstudio_names_action = view_menu.addAction("&TunerStudio Table Names")
+        self.view_menu = self.menuBar().addMenu("&View")
+        self.tunerstudio_names_action = self.view_menu.addAction("&TunerStudio Table Names")
         self.tunerstudio_names_action.setCheckable(True)
         self.tunerstudio_names_action.setChecked(True)
         self.tunerstudio_names_action.triggered.connect(self._on_tunerstudio_names_toggled)
 
-        self.only_show_favorited_tables_action = view_menu.addAction("&Favorite Tables Only")
+        self.only_show_favorited_tables_action = self.view_menu.addAction("&Favorite Tables Only")
         self.only_show_favorited_tables_action.setCheckable(True)
         self.only_show_favorited_tables_action.setChecked(self.only_show_favorited_tables)
         self.only_show_favorited_tables_action.triggered.connect(self._on_only_show_favorited_toggled)
 
-        self.show_2d_tables_action = view_menu.addAction("Show &2D Tables")
+        self.show_2d_tables_action = self.view_menu.addAction("Show &2D Tables")
         self.show_2d_tables_action.setCheckable(True)
         self.show_2d_tables_action.setChecked(self.show_2d_tables)
         self.show_2d_tables_action.triggered.connect(self._on_show_2d_tables_toggled)
 
-        self.show_1d_tables_action = view_menu.addAction("Show &1D Tables")
+        self.show_1d_tables_action = self.view_menu.addAction("Show &1D Tables")
         self.show_1d_tables_action.setCheckable(True)
         self.show_1d_tables_action.setChecked(self.show_1d_tables)
         self.show_1d_tables_action.triggered.connect(self._on_show_1d_tables_toggled)
         # Grey out dimensional filters when showing only favorited tables
         self.show_2d_tables_action.setEnabled(not self.only_show_favorited_tables)
         self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
+
+    def _set_tune_save_actions_enabled(self, enabled: bool) -> None:
+        if self.save_tune_action is not None:
+            self.save_tune_action.setEnabled(enabled)
+        if self.save_tune_as_action is not None:
+            self.save_tune_as_action.setEnabled(enabled)
+
+        self.view_menu.addSeparator()
+        save_default_layout_action = self.view_menu.addAction("Save Current Layout As Default")
+        save_default_layout_action.triggered.connect(self._save_default_window_layout)
+
+        load_default_layout_action = self.view_menu.addAction("Load Default Window Layout")
+        load_default_layout_action.triggered.connect(self._load_default_window_layout)
+
+        reset_layout_action = self.view_menu.addAction("Reset Window Layout")
+        reset_layout_action.triggered.connect(self._reset_window_layout)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_dock_layout()
+        super().closeEvent(event)
+
+    def _restore_dock_layout(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        default_geometry = settings.value(self.DEFAULT_WINDOW_GEOMETRY_KEY)
+        default_dock_state = settings.value(self.DEFAULT_WINDOW_DOCK_STATE_KEY)
+        geometry = settings.value(self.WINDOW_GEOMETRY_KEY)
+        dock_state = settings.value(self.WINDOW_DOCK_STATE_KEY)
+
+        restored = False
+        if default_geometry is not None and default_dock_state is not None:
+            restored = bool(self.restoreGeometry(default_geometry) and self.restoreState(default_dock_state))
+
+        if not restored and geometry is not None and dock_state is not None:
+            restored = bool(self.restoreGeometry(geometry) and self.restoreState(dock_state))
+
+        if not restored:
+            self._apply_standard_window_layout()
+
+        self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
+
+    def _save_dock_layout(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        settings.setValue(self.WINDOW_GEOMETRY_KEY, self.saveGeometry())
+        settings.setValue(self.WINDOW_DOCK_STATE_KEY, self.saveState())
+
+    def _apply_standard_window_layout(self) -> None:
+        self.resize(1200, 800)
+        self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
+
+        for dock in [self.tune_tables_dock, self.selected_table_dock, self.row_viz_dock, self.row_editor_dock]:
+            dock.setFloating(False)
+            dock.show()
+
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.tune_tables_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.selected_table_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.row_viz_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.row_editor_dock)
+
+        self.tabifyDockWidget(self.selected_table_dock, self.row_viz_dock)
+        self.tabifyDockWidget(self.selected_table_dock, self.row_editor_dock)
+        self.selected_table_dock.raise_()
+        self.resizeDocks([self.tune_tables_dock, self.selected_table_dock], [320, 920], Qt.Orientation.Horizontal)
+
+    def _save_default_window_layout(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        settings.setValue(self.DEFAULT_WINDOW_GEOMETRY_KEY, self.saveGeometry())
+        settings.setValue(self.DEFAULT_WINDOW_DOCK_STATE_KEY, self.saveState())
+        self.statusBar().showMessage("Saved current layout as default.", 3000)
+
+    def _load_default_window_layout(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        geometry = settings.value(self.DEFAULT_WINDOW_GEOMETRY_KEY)
+        dock_state = settings.value(self.DEFAULT_WINDOW_DOCK_STATE_KEY)
+
+        if geometry is None or dock_state is None:
+            self._apply_standard_window_layout()
+            self.statusBar().showMessage("No saved default layout found. Applied standard layout.", 4000)
+            return
+
+        geometry_ok = self.restoreGeometry(geometry)
+        dock_ok = self.restoreState(dock_state)
+        self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
+        if not geometry_ok or not dock_ok:
+            self._apply_standard_window_layout()
+            self.statusBar().showMessage("Saved default layout was invalid. Applied standard layout.", 4000)
+            return
+
+        self.statusBar().showMessage("Loaded default window layout.", 3000)
+
+    def _reset_window_layout(self) -> None:
+        settings = QSettings("GyattOTune", "GyattOTune")
+        settings.remove(self.WINDOW_GEOMETRY_KEY)
+        settings.remove(self.WINDOW_DOCK_STATE_KEY)
+
+        self._apply_standard_window_layout()
+        self.statusBar().showMessage("Window layout reset to standard defaults. Saved default layout was preserved.", 4000)
+
+    def _create_section_dock(self, title: str, object_name: str, content: QWidget) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(object_name)
+        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        dock.setWidget(content)
+        return dock
+
+    def _create_outlined_panel(self, content: QWidget) -> QGroupBox:
+        panel = QGroupBox("")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(content)
+        return panel
+
+    def _set_row_editor_button_visibility(
+        self,
+        show_generate: bool,
+        show_apply_predictions: bool,
+        show_write: bool,
+        show_revert: bool,
+    ) -> None:
+        self.generate_average_button.setVisible(show_generate)
+        self.apply_average_to_row_button.setVisible(show_apply_predictions)
+        _ = show_write
+        self.revert_row_changes_button.setVisible(show_revert)
+
+    def _refresh_history_action_state(self) -> None:
+        if self.undo_action is not None:
+            self.undo_action.setEnabled(bool(self.global_undo_stack))
+        if self.redo_action is not None:
+            self.redo_action.setEnabled(bool(self.global_redo_stack))
+
+    def _clear_global_history(self) -> None:
+        self.global_undo_stack.clear()
+        self.global_redo_stack.clear()
+        self._refresh_history_action_state()
+
+    def _current_editor_cell_coordinates(self, column_index: int) -> tuple[int, int] | None:
+        if self.current_table is None:
+            return None
+        if column_index < 0:
+            return None
+
+        if self.current_table.rows == 1:
+            if column_index >= self.current_table.cols:
+                return None
+            return (0, column_index)
+
+        if self.current_table.cols == 1:
+            if column_index >= self.current_table.rows:
+                return None
+            return (column_index, 0)
+
+        if self.selected_table_row_idx is None:
+            return None
+        if column_index >= self.current_table.cols:
+            return None
+        return (self.selected_table_row_idx, column_index)
+
+    def _record_global_cell_edit(
+        self,
+        table_name: str,
+        row_index: int,
+        column_index: int,
+        old_value: float,
+        new_value: float,
+    ) -> None:
+        if self._history_is_applying:
+            return
+        if abs(float(new_value) - float(old_value)) <= 1e-9:
+            return
+
+        self.global_undo_stack.append(
+            {
+                "table": table_name,
+                "row": int(row_index),
+                "col": int(column_index),
+                "old": float(old_value),
+                "new": float(new_value),
+            }
+        )
+        if len(self.global_undo_stack) > 5000:
+            self.global_undo_stack = self.global_undo_stack[-5000:]
+        self.global_redo_stack.clear()
+        self._refresh_history_action_state()
+
+    def _find_table_list_item(self, table_name: str) -> QListWidgetItem | None:
+        for idx in range(self.table_list.count()):
+            item = self.table_list.item(idx)
+            if item is None:
+                continue
+            if item.data(Qt.ItemDataRole.UserRole) == table_name:
+                return item
+        return None
+
+    def _set_staged_cell_value(self, table_name: str, row_index: int, column_index: int, value: float) -> None:
+        if self.tune_data is None:
+            return
+        table = self.tune_data.tables.get(table_name)
+        if table is None:
+            return
+        if row_index < 0 or row_index >= table.rows or column_index < 0 or column_index >= table.cols:
+            return
+
+        baseline_cell_value = float(table.values[row_index][column_index])
+        table_state = self.pending_edits_per_table.setdefault(
+            table_name,
+            {"rows": {}, "one_d": None, "average_line_data": None},
+        )
+
+        if table.rows == 1:
+            baseline_row = [float(v) for v in table.values[0]]
+            working_row = table_state.get("one_d")
+            if not isinstance(working_row, list) or len(working_row) != table.cols:
+                working_row = [float(v) for v in baseline_row]
+            working_row[column_index] = float(value)
+            table_state["one_d"] = None if not self._values_differ(working_row, baseline_row) else [float(v) for v in working_row]
+        elif table.cols == 1:
+            baseline_values = [float(r[0]) for r in table.values]
+            working_values = table_state.get("one_d")
+            if not isinstance(working_values, list) or len(working_values) != table.rows:
+                working_values = [float(v) for v in baseline_values]
+            working_values[row_index] = float(value)
+            table_state["one_d"] = None if not self._values_differ(working_values, baseline_values) else [float(v) for v in working_values]
+        else:
+            rows_state = table_state.setdefault("rows", {})
+            baseline_row = [float(v) for v in table.values[row_index]]
+            working_row = rows_state.get(row_index)
+            if not isinstance(working_row, list) or len(working_row) != table.cols:
+                working_row = [float(v) for v in baseline_row]
+            working_row[column_index] = float(value)
+            if self._values_differ(working_row, baseline_row):
+                rows_state[row_index] = [float(v) for v in working_row]
+            else:
+                rows_state.pop(row_index, None)
+
+        if abs(float(value) - baseline_cell_value) <= 1e-9:
+            # Ensure no stray row override remains for the exact baseline cell.
+            self._stage_current_row_edits()
+
+        if not table_state.get("rows") and table_state.get("one_d") is None:
+            self.pending_edits_per_table.pop(table_name, None)
+
+    def _navigate_to_table_cell(self, table_name: str, row_index: int, column_index: int) -> bool:
+        item = self._find_table_list_item(table_name)
+        if item is None:
+            return False
+
+        self.table_list.setCurrentItem(item)
+        if self.current_table is None:
+            return False
+
+        if self.current_table.rows == 1:
+            preferred_column = column_index
+            self._load_selected_table_row(0, preferred_column=preferred_column)
+            return True
+
+        if self.current_table.cols == 1:
+            preferred_column = row_index
+            self._load_selected_table_row(row_index, preferred_column=preferred_column)
+            return True
+
+        self._load_selected_table_row(row_index, preferred_column=column_index)
+        return True
+
+    def _apply_history_entry(self, entry: dict[str, Any], use_new_value: bool) -> bool:
+        if self.tune_data is None:
+            return False
+
+        table_name = str(entry.get("table", ""))
+        row_index = int(entry.get("row", -1))
+        column_index = int(entry.get("col", -1))
+        target_value = float(entry.get("new" if use_new_value else "old", 0.0))
+        if not table_name:
+            return False
+
+        self._history_is_applying = True
+        try:
+            self._set_staged_cell_value(table_name, row_index, column_index, target_value)
+            navigated = self._navigate_to_table_cell(table_name, row_index, column_index)
+            if not navigated:
+                return False
+
+            editor_column = column_index
+            if self.current_table is not None and self.current_table.cols == 1:
+                editor_column = row_index
+            if 0 <= editor_column < len(self.pending_row_values):
+                self.pending_row_values[editor_column] = float(target_value)
+                self._refresh_table_row_editor(preferred_column=editor_column)
+                self._update_table_grid_row_visualization(include_row_plot=False)
+                self._schedule_table_grid_row_visualization_update()
+            return True
+        finally:
+            self._history_is_applying = False
+
+    def _trigger_global_undo(self) -> None:
+        if not self.global_undo_stack:
+            return
+        entry = self.global_undo_stack.pop()
+        applied = self._apply_history_entry(entry, use_new_value=False)
+        if applied:
+            self.global_redo_stack.append(entry)
+        self._refresh_history_action_state()
+
+    def _trigger_global_redo(self) -> None:
+        if not self.global_redo_stack:
+            return
+        entry = self.global_redo_stack.pop()
+        applied = self._apply_history_entry(entry, use_new_value=True)
+        if applied:
+            self.global_undo_stack.append(entry)
+        self._refresh_history_action_state()
+
+    def _apply_row_editor_selection_highlight(self) -> None:
+        if not self.pending_row_values:
+            return
+
+        minimum, maximum = self._matrix_min_max([self.pending_row_values])
+        span = max(maximum - minimum, 1e-9)
+        selected_column = self.table_row_editor.currentColumn()
+
+        for column_index, value in enumerate(self.pending_row_values):
+            item = self.table_row_editor.item(0, column_index)
+            if item is None:
+                continue
+            if column_index == selected_column:
+                item.setBackground(QColor(220, 70, 70, 200))
+            else:
+                item.setBackground(self._cell_color(value, minimum, span))
+
+    def _sync_editor_selection_to_row_plot(self) -> None:
+        if not self.pending_row_values or self.table_row_editor.columnCount() == 0:
+            self.table_row_panel.clear_selected_point()
+            return
+
+        column_index = self.table_row_editor.currentColumn()
+        if 0 <= column_index < self.table_row_editor.columnCount():
+            self.table_row_panel.select_table_point(column_index, emit_callback=False)
+        else:
+            self.table_row_panel.clear_selected_point()
+
+    def _on_row_editor_current_cell_changed(
+        self,
+        current_row: int,
+        current_column: int,
+        previous_row: int,
+        previous_column: int,
+    ) -> None:
+        _ = (current_row, current_column, previous_row, previous_column)
+        self._apply_row_editor_selection_highlight()
+        self._sync_editor_selection_to_row_plot()
+
+    def _on_row_editor_focus_changed(self, has_focus: bool) -> None:
+        _ = has_focus
+        self._apply_row_editor_selection_highlight()
+        self._sync_editor_selection_to_row_plot()
 
     def _on_load_most_recent_tune_shortcut(self) -> None:
         """Ctrl+T: load most recent tune from working folder or recent files."""
@@ -1661,13 +2210,16 @@ class MainWindow(QMainWindow):
         try:
             self.tune_data = self.tune_loader.load(file_path)
             self.selected_rows_per_table = {}  # Clear saved row selections for new tune
+            self.pending_edits_per_table = {}  # Clear saved pending edits for new tune
+            self.loaded_table_snapshots = self._snapshot_table_values(self.tune_data)
+            self._clear_global_history()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Tune Load Error", f"Could not load tune file:\n{exc}")
             return
 
         self.loaded_tune_path = file_path
-        if self.save_tune_as_action is not None:
-            self.save_tune_as_action.setEnabled(True)
+        self.save_target_path = None
+        self._set_tune_save_actions_enabled(True)
         self.table_list.clear()
         if self.tune_data.tables:
             self._update_table_display()
@@ -1678,6 +2230,7 @@ class MainWindow(QMainWindow):
             self.table_grid.setRowCount(0)
             self.table_grid.setColumnCount(0)
             self.table_meta.setText("No tables found in this tune file")
+            self.table_meta.setToolTip("")
             self.axis_meta.setText("Axes: X (index), Y (index)")
 
         self.statusBar().showMessage(f"Loaded tune: {file_path.name}")
@@ -1747,7 +2300,7 @@ class MainWindow(QMainWindow):
                     continue
             
             display_name = self._get_tunerstudio_name(table_name) if self.show_tunerstudio_names else table_name
-            if table_name in self.favorite_tables:
+            if table_name in self.favorite_tables and not self.only_show_favorited_tables:
                 display_name = f"★ {display_name}"
             all_items.append((table_name, display_name))
 
@@ -1873,37 +2426,65 @@ class MainWindow(QMainWindow):
         self._update_table_display()
 
     def _create_layout(self) -> None:
-        root = QWidget(self)
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(8, 8, 8, 8)
-
-        # Create main splitter for left panel and right panel
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        root_layout.addWidget(splitter)
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(
+            QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AllowTabbedDocks
+            | QMainWindow.DockOption.GroupedDragging
+            | QMainWindow.DockOption.AnimatedDocks
+        )
+        self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
 
         # Left panel - Tune Tables
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("Tune Tables"))
-
-        self.table_list = QListWidget()
-        self.table_list.addItem("Load a tune file to see parsed tables")
+        self.table_list = TuneTablesListWidget()
+        self.table_list.on_tune_file_dropped = self._on_tune_file_dropped
+        self.table_list.setStyleSheet(
+            """
+            QListWidget {
+                border: none;
+                background: transparent;
+                padding: 4px;
+                outline: 0;
+            }
+            QListWidget::item {
+                border-radius: 10px;
+                border: 1px solid palette(mid);
+                background-color: palette(base);
+                color: palette(text);
+                margin: 4px 6px;
+                padding: 8px 10px;
+            }
+            QListWidget::item:hover {
+                background-color: palette(alternate-base);
+                border: 1px solid palette(midlight);
+            }
+            QListWidget::item:selected {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+                border: 1px solid palette(light);
+            }
+            """
+        )
+        self._add_open_tune_file_placeholder()
         self.table_list.currentItemChanged.connect(self._on_table_selected)
+        self.table_list.itemClicked.connect(self._on_table_list_item_clicked)
         self.table_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_list.customContextMenuRequested.connect(self._show_table_context_menu)
         left_layout.addWidget(self.table_list)
 
-        # Right panel - Table display with editor
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        # Selected table panel
+        selected_table_panel = QWidget()
+        selected_table_layout = QVBoxLayout(selected_table_panel)
+        selected_table_layout.setContentsMargins(0, 0, 0, 0)
 
         self.table_meta = QLabel("No table selected")
-        right_layout.addWidget(self.table_meta)
+        selected_table_layout.addWidget(self.table_meta)
 
         self.axis_meta = QLabel("Axes: X (index), Y (index)")
-        right_layout.addWidget(self.axis_meta)
+        selected_table_layout.addWidget(self.axis_meta)
 
         controls_layout = QHBoxLayout()
         self.transpose_checkbox = QCheckBox("Transpose Table")
@@ -1915,43 +2496,49 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.swap_axes_checkbox)
 
         controls_layout.addStretch(1)
-        right_layout.addLayout(controls_layout)
+        selected_table_layout.addLayout(controls_layout)
 
         self.table_grid = CopyPasteTableWidget()
         self.table_grid.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table_grid.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table_grid.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
         self.table_grid.itemSelectionChanged.connect(self._on_table_grid_row_selection_changed)
         self.table_grid.cellClicked.connect(self._on_table_grid_cell_clicked)
         self.table_grid.currentCellChanged.connect(self._on_table_grid_current_cell_changed)
+        self.table_grid.on_adjust_value = self._on_selected_table_cell_adjust_requested
+        self.table_grid.on_undo = self._on_selected_table_cell_undo_requested
+        self.table_grid.on_redo = self._on_selected_table_cell_redo_requested
         self.table_grid.horizontalHeader().setVisible(False)
         self.table_grid.verticalHeader().setVisible(True)  # leftmost axis labels
-        
-        self.table_sections_splitter = QSplitter(Qt.Orientation.Horizontal)
-        right_layout.addWidget(self.table_sections_splitter, 1)
 
         table_grid_container = QWidget()
         self.table_grid_container = table_grid_container
         table_grid_layout = QVBoxLayout(table_grid_container)
         table_grid_layout.setContentsMargins(0, 0, 0, 0)
         table_grid_layout.addWidget(self.table_grid)
-        self.table_sections_splitter.addWidget(table_grid_container)
+        self.modified_table_meta = QLabel("")
+        self.modified_table_meta.setVisible(False)
+        table_grid_layout.addWidget(self.modified_table_meta)
 
-        self.table_details_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.table_sections_splitter.addWidget(self.table_details_splitter)
+        self.modified_table_grid = CopyPasteTableWidget()
+        self.modified_table_grid.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.modified_table_grid.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.modified_table_grid.horizontalHeader().setVisible(False)
+        self.modified_table_grid.verticalHeader().setVisible(True)
+        self.modified_table_grid.setVisible(False)
+        table_grid_layout.addWidget(self.modified_table_grid)
+        selected_table_layout.addWidget(table_grid_container, 1)
 
         self.table_row_panel = RowVisualizationPanel()
         self.table_row_panel.on_point_selected = self._on_table_row_plot_point_selected
         self.table_row_panel.on_point_adjust_requested = self._on_table_row_plot_point_adjust_requested
         self.table_row_panel.on_visibility_changed = self._on_row_viz_visibility_changed
-        self.table_details_splitter.addWidget(self.table_row_panel)
 
-        self.table_row_editor_group = QGroupBox("Selected Row Editor")
+        self.table_row_editor_group = QGroupBox("")
         row_editor_layout = QVBoxLayout(self.table_row_editor_group)
 
         row_editor_controls = QHBoxLayout()
         self.table_row_label = QLabel("Selected row: none")
         row_editor_controls.addWidget(self.table_row_label)
-        row_editor_controls.addStretch(1)
         self.generate_average_button = QPushButton("Predict VE Value")
         self.generate_average_button.setToolTip(
             "Predict VE values from nearby logged VE points using EGO-corrected VE and matching AFR readings."
@@ -1961,17 +2548,18 @@ class MainWindow(QMainWindow):
         self.apply_average_to_row_button = QPushButton("Apply Predictions")
         self.apply_average_to_row_button.clicked.connect(self._apply_average_to_selected_row)
         row_editor_controls.addWidget(self.apply_average_to_row_button)
-        self.apply_row_changes_button = QPushButton("Write Row To Table Grid")
-        self.apply_row_changes_button.clicked.connect(self._apply_pending_row_changes)
-        row_editor_controls.addWidget(self.apply_row_changes_button)
         self.revert_row_changes_button = QPushButton("Revert Row")
         self.revert_row_changes_button.clicked.connect(self._revert_pending_row_values)
         row_editor_controls.addWidget(self.revert_row_changes_button)
+        row_editor_controls.addStretch(1)
         row_editor_layout.addLayout(row_editor_controls)
 
         self.table_row_editor = RowEditorTableWidget()
         self.table_row_editor.on_adjust_value = self._adjust_pending_row_value
         self.table_row_editor.on_undo = self._undo_pending_row_edit
+        self.table_row_editor.on_redo = self._redo_pending_row_edit
+        self.table_row_editor.on_focus_changed = self._on_row_editor_focus_changed
+        self.table_row_editor.currentCellChanged.connect(self._on_row_editor_current_cell_changed)
         self.table_row_editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_row_editor.customContextMenuRequested.connect(self._on_row_editor_context_menu)
         row_editor_layout.addWidget(self.table_row_editor)
@@ -1986,29 +2574,51 @@ class MainWindow(QMainWindow):
         row_editor_container_layout.setContentsMargins(0, 0, 0, 0)
         row_editor_container_layout.addWidget(self.table_row_editor_group)
         self.table_row_editor.setEnabled(False)
-        self.generate_average_button.setEnabled(False)
-        self.apply_average_to_row_button.setEnabled(False)
-        self.apply_row_changes_button.setEnabled(False)
-        self.revert_row_changes_button.setEnabled(False)
+        self._set_row_editor_button_visibility(
+            show_generate=False,
+            show_apply_predictions=False,
+            show_write=False,
+            show_revert=False,
+        )
 
         self.table_row_status = QLabel("Select a VE table and click a row to view and edit it.")
         row_editor_container_layout.addWidget(self.table_row_status)
 
-        self.table_details_splitter.addWidget(row_editor_container)
+        # Wrap row visualization panel to avoid it inheriting dock margins directly.
+        row_viz_container = QWidget()
+        row_viz_layout = QVBoxLayout(row_viz_container)
+        row_viz_layout.setContentsMargins(0, 0, 0, 0)
+        row_viz_layout.addWidget(self.table_row_panel)
 
-        self.table_sections_splitter.setStretchFactor(0, 6)
-        self.table_sections_splitter.setStretchFactor(1, 4)
-        self.table_details_splitter.setStretchFactor(0, 3)
-        self.table_details_splitter.setStretchFactor(1, 2)
-        self.table_sections_splitter.setSizes([900, 600])
-        self.table_details_splitter.setSizes([420, 260])
+        self.tune_tables_dock = self._create_section_dock(
+            "Tune Tables",
+            "tuneTablesDock",
+            self._create_outlined_panel(left),
+        )
+        self.selected_table_dock = self._create_section_dock(
+            "Selected Table",
+            "selectedTableDock",
+            self._create_outlined_panel(selected_table_panel),
+        )
+        self.row_viz_dock = self._create_section_dock("Row Data Visualization", "rowVizDock", row_viz_container)
+        self.row_editor_dock = self._create_section_dock(
+            "Selected Row Editor",
+            "rowEditorDock",
+            self._create_outlined_panel(row_editor_container),
+        )
 
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.tune_tables_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.selected_table_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.row_viz_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.row_editor_dock)
 
-        self.setCentralWidget(root)
+        self._apply_standard_window_layout()
+
+        self.view_menu.addSeparator()
+        self.view_menu.addAction(self.tune_tables_dock.toggleViewAction())
+        self.view_menu.addAction(self.selected_table_dock.toggleViewAction())
+        self.view_menu.addAction(self.row_viz_dock.toggleViewAction())
+        self.view_menu.addAction(self.row_editor_dock.toggleViewAction())
 
     def _find_closest_index(self, values: list[float], target: float) -> int | None:
         """Find the index of the closest value in a list."""
@@ -2865,7 +3475,7 @@ class MainWindow(QMainWindow):
 
             if predicted_ve is not None:
                 average_rpm_values.append(target_rpm)
-                average_ve_values.append(predicted_ve)
+                average_ve_values.append(self._round_ve_prediction(predicted_ve))
                 average_afr_target_values.append(target_afr)
 
         if not average_rpm_values:
@@ -2894,7 +3504,12 @@ class MainWindow(QMainWindow):
             f"predicted {len(average_rpm_values)}/{len(rpm_bins)} row points"
             f"{f', skipped {skipped_points} for low data' if skipped_points > 0 else ''}."
         )
-        self.apply_average_to_row_button.setEnabled(True)
+        self._set_row_editor_button_visibility(
+            show_generate=True,
+            show_apply_predictions=True,
+            show_write=bool(self.pending_row_values),
+            show_revert=bool(self.pending_row_values),
+        )
         self._update_table_grid_row_visualization()
 
 
@@ -2946,10 +3561,16 @@ class MainWindow(QMainWindow):
         apply_action = menu.addAction(f"Apply Prediction ({avg_value:.4g}) to This Cell")
         result = menu.exec(self.table_row_editor.viewport().mapToGlobal(pos))
         if result is apply_action:
-            self._commit_pending_row_undo_state()
+            old_value = float(self.pending_row_values[col])
             self.pending_row_values[col] = avg_value
+            table_name = self._current_table_name()
+            cell_coords = self._current_editor_cell_coordinates(col)
+            if table_name is not None and cell_coords is not None:
+                row_index, source_col = cell_coords
+                self._record_global_cell_edit(table_name, row_index, source_col, old_value, float(avg_value))
             self._refresh_table_row_editor()
-            self._update_table_grid_row_visualization()
+            self._update_table_grid_row_visualization(include_row_plot=False)
+            self._schedule_table_grid_row_visualization_update()
 
     def _apply_average_to_selected_row(self) -> None:
         if (
@@ -2971,22 +3592,35 @@ class MainWindow(QMainWindow):
         # Build a lookup of RPM bins that actually have averaged data
         avg_by_rpm = dict(zip(avg_rpm_values, avg_ve_values))
 
-        self._commit_pending_row_undo_state()
         new_pending = list(self.pending_row_values)
+        table_name = self._current_table_name()
         for i, target_rpm in enumerate(self.current_x_axis.values):
             rpm_key = float(target_rpm)
             if rpm_key in avg_by_rpm:
-                new_pending[i] = avg_by_rpm[rpm_key]
+                old_value = float(new_pending[i])
+                new_value = float(avg_by_rpm[rpm_key])
+                new_pending[i] = new_value
+                cell_coords = self._current_editor_cell_coordinates(i)
+                if table_name is not None and cell_coords is not None:
+                    row_index, source_col = cell_coords
+                    self._record_global_cell_edit(table_name, row_index, source_col, old_value, new_value)
         self.pending_row_values = new_pending
         self._refresh_table_row_editor()
-        self._update_table_grid_row_visualization()
+        self._update_table_grid_row_visualization(include_row_plot=False)
+        self._schedule_table_grid_row_visualization_update()
         applied_count = len(avg_rpm_values)
-        self.table_row_status.setText(f"Applied predictions to {applied_count} of {len(self.current_x_axis.values)} cells with log data. Click 'Write Row To Table Grid' to commit.")
+        self.table_row_status.setText(f"Applied predictions to {applied_count} of {len(self.current_x_axis.values)} cells with log data.")
 
-    def _update_table_grid_row_visualization(self) -> None:
+    def _update_table_grid_row_visualization(self, include_row_plot: bool = True) -> None:
+        self._stage_current_row_edits()
+        self._refresh_current_table_diff_previews()
+
         available, message = self._table_row_editing_available()
         if not available:
             self._clear_table_row_editor(message)
+            return
+
+        if not include_row_plot:
             return
 
         if self.current_table is not None and self._is_current_table_1d():
@@ -3008,13 +3642,15 @@ class MainWindow(QMainWindow):
 
             self._last_row_viz_dataset_key = dataset_key
             self.table_row_label.setText("Selected row: full 1D table")
-            self.generate_average_button.setEnabled(False)
-            self.apply_average_to_row_button.setEnabled(False)
-            self.apply_row_changes_button.setEnabled(bool(self.pending_row_values))
-            self.revert_row_changes_button.setEnabled(bool(self.pending_row_values))
+            self._set_row_editor_button_visibility(
+                show_generate=False,
+                show_apply_predictions=False,
+                show_write=False,
+                show_revert=bool(self.pending_row_values),
+            )
             self.table_row_status.setText(
                 f"Editing full 1D table values for {self.current_table.name}. "
-                "Use scroll wheel, arrow keys, plot point selection, and Write Row To Table Grid."
+                "Use scroll wheel, arrow keys, and plot point selection to stage changes."
             )
             return
 
@@ -3059,11 +3695,62 @@ class MainWindow(QMainWindow):
         if not auto_view_all and selected_table_point_index is not None:
             self.table_row_panel.select_table_point(selected_table_point_index)
         self._last_row_viz_dataset_key = dataset_key
-        status_message = f"Editing MAP {map_value:g} kPa for {self.current_table.name}. Click 'Write Row To Table Grid' to commit changes."
+        status_message = f"Editing MAP {map_value:g} kPa for {self.current_table.name}. Changes are previewed below as a modified table."
         prediction_summary = self._current_editor_prediction_summary(payload)
         if prediction_summary:
             status_message = f"{status_message} {prediction_summary}"
         self.table_row_status.setText(status_message)
+
+    def _schedule_table_grid_row_visualization_update(self, delay_ms: int = 60) -> None:
+        # Coalesce rapid editor updates so large log datasets do not stall the UI.
+        self._row_viz_refresh_timer.start(max(0, int(delay_ms)))
+
+    def _apply_deferred_row_visualization_update(self) -> None:
+        self._update_table_grid_row_visualization(include_row_plot=True)
+
+    def _refresh_current_table_diff_previews(self) -> None:
+        if self.current_table is None:
+            return
+
+        base_matrix, _, _ = self._table_display_state(self.current_table, self.current_x_axis, self.current_y_axis)
+        modified_matrix = self._table_matrix_with_pending_edits(self.current_table, self.current_x_axis, self.current_y_axis)
+        diff_cells = self._diff_cells(base_matrix, modified_matrix)
+        self._refresh_main_table_diff_highlight(base_matrix, diff_cells)
+        self._refresh_modified_table_preview(
+            self.current_table,
+            self.current_x_axis,
+            self.current_y_axis,
+            modified_matrix,
+            diff_cells,
+        )
+
+    def _refresh_main_table_diff_highlight(
+        self,
+        base_matrix: list[list[float]],
+        diff_cells: set[tuple[int, int]],
+    ) -> None:
+        if not base_matrix:
+            return
+
+        row_count = len(base_matrix)
+        col_count = len(base_matrix[0]) if base_matrix else 0
+        if self.table_grid.rowCount() < row_count or self.table_grid.columnCount() < col_count:
+            return
+
+        display_matrix = list(reversed(base_matrix))
+        minimum, maximum = self._matrix_min_max(display_matrix)
+        span = max(maximum - minimum, 1e-9)
+
+        for display_row, row_values in enumerate(display_matrix):
+            source_row = row_count - 1 - display_row
+            for col_index, value in enumerate(row_values):
+                item = self.table_grid.item(display_row, col_index)
+                if item is None:
+                    continue
+                if (source_row, col_index) in diff_cells:
+                    item.setBackground(QColor(210, 65, 65, 210))
+                else:
+                    item.setBackground(self._cell_color(value, minimum, span))
 
     def _current_editor_prediction_summary(self, payload: dict[str, Any]) -> str:
         if self._row_table_type() != "ve":
@@ -3117,16 +3804,25 @@ class MainWindow(QMainWindow):
         self.pending_row_values = []
         self.row_default_values = []
         self.row_edit_undo_stack = []
+        self._active_row_edit_column = None
+        self._active_row_edit_snapshot = None
         self.average_line_data = None
+        self.modified_table_meta.setVisible(False)
+        self.modified_table_grid.setVisible(False)
+        self.modified_table_grid.clear()
+        self.modified_table_grid.setRowCount(0)
+        self.modified_table_grid.setColumnCount(0)
         self.table_row_label.setText("Selected row: none")
         self.table_row_editor.clear()
         self.table_row_editor.setRowCount(1)
         self.table_row_editor.setColumnCount(0)
         self.table_row_editor.setEnabled(False)
-        self.generate_average_button.setEnabled(False)
-        self.apply_average_to_row_button.setEnabled(False)
-        self.apply_row_changes_button.setEnabled(False)
-        self.revert_row_changes_button.setEnabled(False)
+        self._set_row_editor_button_visibility(
+            show_generate=False,
+            show_apply_predictions=False,
+            show_write=False,
+            show_revert=False,
+        )
         self._last_row_viz_dataset_key = None
         self.table_row_panel.clear_visualization()
         self.table_row_status.setText(status_message)
@@ -3172,17 +3868,18 @@ class MainWindow(QMainWindow):
             self._clear_table_row_editor("Click a row in the table grid to view and edit it.")
             return
 
-        self._load_selected_table_row(source_row)
+        current_column = self.table_grid.currentColumn()
+        preferred_column = current_column if current_column >= 0 else None
+        self._load_selected_table_row(source_row, preferred_column=preferred_column)
 
     def _on_table_grid_cell_clicked(self, row: int, column: int) -> None:
-        _ = column
         if self._is_current_table_1d():
             self._update_table_grid_row_visualization()
             return
         source_row = self._display_row_to_source_row(row)
         if source_row is None:
             return
-        self._load_selected_table_row(source_row)
+        self._load_selected_table_row(source_row, preferred_column=column)
 
     def _on_table_grid_current_cell_changed(
         self,
@@ -3191,44 +3888,58 @@ class MainWindow(QMainWindow):
         previous_row: int,
         previous_column: int,
     ) -> None:
-        _ = (current_column, previous_row, previous_column)
+        _ = (previous_row, previous_column)
         if self._is_current_table_1d():
             self._update_table_grid_row_visualization()
             return
         source_row = self._display_row_to_source_row(current_row)
         if source_row is None:
             return
-        self._load_selected_table_row(source_row)
+        self._load_selected_table_row(source_row, preferred_column=current_column)
 
-    def _load_selected_table_row(self, source_row: int) -> None:
+    def _load_selected_table_row(self, source_row: int, preferred_column: int | None = None) -> None:
         if self.current_table is None or self.current_x_axis is None or self.current_y_axis is None:
             return
 
+        table_name = self._current_table_name()
+        if table_name is None:
+            return
+
+        # Preserve edits for the previously active row before switching rows.
+        self._stage_current_row_edits()
+
         if self._is_current_table_1d():
             self.selected_table_row_idx = 0
-            if self.current_table.rows == 1:
-                self.pending_row_values = [float(value) for value in self.current_table.values[0]]
-            else:
-                self.pending_row_values = [float(row[0]) for row in self.current_table.values]
-            self.row_default_values = [float(value) for value in self.pending_row_values]
+            baseline_values = self._row_values_for_table(self.current_table)
+            staged_values = self._staged_row_values(table_name, self.current_table, 0)
+            self.pending_row_values = staged_values if staged_values is not None else baseline_values
+            self.row_default_values = [float(value) for value in baseline_values]
             self.row_edit_undo_stack = []
-            self.average_line_data = None
+            self._active_row_edit_column = None
+            self._active_row_edit_snapshot = None
+            saved = self.pending_edits_per_table.get(table_name, {})
+            self.average_line_data = saved.get("average_line_data")
             self.table_row_label.setText("Selected row: full 1D table")
-            self._refresh_table_row_editor()
+            self._refresh_table_row_editor(preferred_column=preferred_column)
             self._update_table_grid_row_visualization()
             return
 
         self.selected_table_row_idx = source_row
-        self.pending_row_values = [float(value) for value in self.current_table.values[source_row]]
-        self.row_default_values = [float(value) for value in self.pending_row_values]
+        baseline_values = self._row_values_for_table(self.current_table, source_row)
+        staged_values = self._staged_row_values(table_name, self.current_table, source_row)
+        self.pending_row_values = staged_values if staged_values is not None else baseline_values
+        self.row_default_values = [float(value) for value in baseline_values]
         self.row_edit_undo_stack = []
-        self.average_line_data = None
+        self._active_row_edit_column = None
+        self._active_row_edit_snapshot = None
+        saved = self.pending_edits_per_table.get(table_name, {})
+        self.average_line_data = saved.get("average_line_data")
         map_value = float(self.current_y_axis.values[source_row])
         self.table_row_label.setText(f"Selected row: MAP {map_value:g} kPa")
-        self._refresh_table_row_editor()
+        self._refresh_table_row_editor(preferred_column=preferred_column)
         self._update_table_grid_row_visualization()
 
-    def _refresh_table_row_editor(self) -> None:
+    def _refresh_table_row_editor(self, preferred_column: int | None = None) -> None:
         self.table_row_editor.blockSignals(True)
         self.table_row_editor.clear()
         self.table_row_editor.setRowCount(1)
@@ -3244,57 +3955,69 @@ class MainWindow(QMainWindow):
             item.setBackground(self._cell_color(value, minimum, span))
             self.table_row_editor.setItem(0, column_index, item)
         if self.pending_row_values:
-            current_column = self.table_row_editor.currentColumn()
-            target_column = current_column if 0 <= current_column < len(self.pending_row_values) else 0
+            if preferred_column is not None and 0 <= preferred_column < len(self.pending_row_values):
+                target_column = preferred_column
+            else:
+                current_column = self.table_row_editor.currentColumn()
+                target_column = current_column if 0 <= current_column < len(self.pending_row_values) else 0
             self.table_row_editor.setCurrentCell(0, target_column)
         self.table_row_editor.resizeColumnsToContents()
         self.table_row_editor.resizeRowsToContents()
         self.table_row_editor.setEnabled(True)
-        self.generate_average_button.setEnabled(self.current_table is not None and "ve" in self.current_table.name.lower())
-        self.apply_average_to_row_button.setEnabled(self.average_line_data is not None and self.current_table is not None and "ve" in self.current_table.name.lower())
-        self.apply_row_changes_button.setEnabled(True)
-        self.revert_row_changes_button.setEnabled(True)
+        can_predict_ve = (
+            self.current_table is not None
+            and "ve" in self.current_table.name.lower()
+            and not self._is_current_table_1d()
+        )
+        self._set_row_editor_button_visibility(
+            show_generate=can_predict_ve,
+            show_apply_predictions=can_predict_ve and self.average_line_data is not None,
+            show_write=False,
+            show_revert=bool(self.pending_row_values),
+        )
         self.table_row_editor.blockSignals(False)
+        self._apply_row_editor_selection_highlight()
+        self._sync_editor_selection_to_row_plot()
 
     def _commit_pending_row_undo_state(self) -> None:
-        self.row_edit_undo_stack.append([float(value) for value in self.pending_row_values])
+        if self._active_row_edit_snapshot is not None:
+            self.row_edit_undo_stack.append([float(value) for value in self._active_row_edit_snapshot])
+        else:
+            self.row_edit_undo_stack.append([float(value) for value in self.pending_row_values])
         if len(self.row_edit_undo_stack) > 100:
             self.row_edit_undo_stack = self.row_edit_undo_stack[-100:]
+        self._active_row_edit_column = None
+        self._active_row_edit_snapshot = None
 
     def _adjust_pending_row_value(self, column_index: int, amount: float) -> None:
         if column_index < 0 or column_index >= len(self.pending_row_values):
             return
-        self._commit_pending_row_undo_state()
-        self.pending_row_values[column_index] = float(self.pending_row_values[column_index] + amount)
-        item = self.table_row_editor.item(0, column_index)
-        if item is None:
-            item = QTableWidgetItem()
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_row_editor.setItem(0, column_index, item)
-        item.setText(f"{self.pending_row_values[column_index]:g}")
-        self._update_table_grid_row_visualization()
+        previous_value = float(self.pending_row_values[column_index])
+        new_value = float(previous_value + amount)
+        self.pending_row_values[column_index] = new_value
 
-    def _undo_pending_row_edit(self, column_index: int) -> None:
-        if (
-            column_index < 0
-            or column_index >= len(self.pending_row_values)
-            or column_index >= len(self.row_default_values)
-        ):
-            return
-        self.pending_row_values[column_index] = float(self.row_default_values[column_index])
+        table_name = self._current_table_name()
+        cell_coords = self._current_editor_cell_coordinates(column_index)
+        if table_name is not None and cell_coords is not None:
+            row_index, source_col = cell_coords
+            self._record_global_cell_edit(table_name, row_index, source_col, previous_value, new_value)
+
         item = self.table_row_editor.item(0, column_index)
         if item is None:
             item = QTableWidgetItem()
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table_row_editor.setItem(0, column_index, item)
         item.setText(f"{self.pending_row_values[column_index]:g}")
-        minimum, maximum = self._matrix_min_max([self.pending_row_values])
-        span = max(maximum - minimum, 1e-9)
-        for c, value in enumerate(self.pending_row_values):
-            row_item = self.table_row_editor.item(0, c)
-            if row_item is not None:
-                row_item.setBackground(self._cell_color(value, minimum, span))
-        self._update_table_grid_row_visualization()
+        self._update_table_grid_row_visualization(include_row_plot=False)
+        self._schedule_table_grid_row_visualization_update()
+
+    def _undo_pending_row_edit(self, column_index: int | None = None) -> None:
+        _ = column_index
+        self._trigger_global_undo()
+
+    def _redo_pending_row_edit(self, column_index: int | None = None) -> None:
+        _ = column_index
+        self._trigger_global_redo()
 
     def _on_table_row_plot_point_selected(
         self,
@@ -3305,6 +4028,10 @@ class MainWindow(QMainWindow):
         if self.table_row_editor.columnCount() == 0:
             return
         if series_id is None:
+            return
+        if series_id != "table":
+            # Allow non-table points (raw/corrected/AFR/etc.) to stay selected in
+            # the plot without forcing editor focus back to the Selected Row line.
             return
 
         target_column: int | None = None
@@ -3331,11 +4058,88 @@ class MainWindow(QMainWindow):
         self.table_row_editor.setCurrentCell(0, index)
         self._adjust_pending_row_value(index, amount)
 
+    def _on_selected_table_cell_adjust_requested(self, display_row: int, column: int, amount: float) -> None:
+        available, _ = self._table_row_editing_available()
+        if not available:
+            return
+
+        if self.current_table is None or self.current_x_axis is None:
+            return
+
+        if column < 0 or column >= self.current_x_axis.length:
+            return
+
+        if self._is_current_table_1d():
+            self._load_selected_table_row(0, preferred_column=column)
+            self._adjust_pending_row_value(column, amount)
+            return
+
+        source_row = self._display_row_to_source_row(display_row)
+        if source_row is None:
+            return
+
+        self._load_selected_table_row(source_row, preferred_column=column)
+        self._adjust_pending_row_value(column, amount)
+
+    def _on_selected_table_cell_undo_requested(self, display_row: int, column: int) -> None:
+        available, _ = self._table_row_editing_available()
+        if not available:
+            return
+
+        if self.current_table is None or self.current_x_axis is None:
+            return
+
+        if column < 0 or column >= self.current_x_axis.length:
+            return
+
+        if self._is_current_table_1d():
+            self._load_selected_table_row(0, preferred_column=column)
+        else:
+            source_row = self._display_row_to_source_row(display_row)
+            if source_row is None:
+                return
+            self._load_selected_table_row(source_row, preferred_column=column)
+        self._trigger_global_undo()
+
+    def _on_selected_table_cell_redo_requested(self, display_row: int, column: int) -> None:
+        available, _ = self._table_row_editing_available()
+        if not available:
+            return
+
+        if self.current_table is None or self.current_x_axis is None:
+            return
+
+        if column < 0 or column >= self.current_x_axis.length:
+            return
+
+        if self._is_current_table_1d():
+            self._load_selected_table_row(0, preferred_column=column)
+        else:
+            source_row = self._display_row_to_source_row(display_row)
+            if source_row is None:
+                return
+            self._load_selected_table_row(source_row, preferred_column=column)
+        self._trigger_global_redo()
+
     def _revert_pending_row_values(self) -> None:
         if not self.row_default_values:
             return
         self._commit_pending_row_undo_state()
         self.pending_row_values = [float(value) for value in self.row_default_values]
+        self._active_row_edit_column = None
+        self._active_row_edit_snapshot = None
+
+        table_name = self._current_table_name()
+        if table_name is not None:
+            state = self.pending_edits_per_table.get(table_name)
+            if state is not None:
+                if self.current_table is not None and self._is_current_table_1d():
+                    state["one_d"] = None
+                elif self.selected_table_row_idx is not None:
+                    state.get("rows", {}).pop(self.selected_table_row_idx, None)
+                if not state.get("rows") and state.get("one_d") is None:
+                    self.pending_edits_per_table.pop(table_name, None)
+
         self._refresh_table_row_editor()
         self._update_table_grid_row_visualization()
 
@@ -3397,13 +4201,14 @@ class MainWindow(QMainWindow):
             self.tune_data = self.tune_loader.load(file_path)
             self.selected_rows_per_table = {}  # Clear saved row selections for new tune
             self.pending_edits_per_table = {}  # Clear saved pending edits for new tune
+            self.loaded_table_snapshots = self._snapshot_table_values(self.tune_data)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Tune Load Error", f"Could not load tune file:\n{exc}")
             return
 
         self.loaded_tune_path = file_path
-        if self.save_tune_as_action is not None:
-            self.save_tune_as_action.setEnabled(True)
+        self.save_target_path = None
+        self._set_tune_save_actions_enabled(True)
         self.table_list.clear()
         if self.tune_data.tables:
             self._update_table_display()
@@ -3414,12 +4219,28 @@ class MainWindow(QMainWindow):
             self.table_grid.setRowCount(0)
             self.table_grid.setColumnCount(0)
             self.table_meta.setText("No tables found in this tune file")
+            self.table_meta.setToolTip("")
             self.axis_meta.setText("Axes: X (index), Y (index)")
 
         self.statusBar().showMessage(f"Loaded tune: {file_path.name}")
         self._refresh_workspace_text()
         self._add_recent_tune_file(file_path)
         self._maybe_prompt_load_matching_log(file_path)
+
+    def _on_tune_file_dropped(self, file_path: Path) -> None:
+        self._open_recent_tune_file(file_path)
+
+    def _add_open_tune_file_placeholder(self) -> None:
+        item = QListWidgetItem("Open Tune File...")
+        item.setData(Qt.ItemDataRole.UserRole, self.OPEN_TUNE_PLACEHOLDER_KEY)
+        item.setToolTip("Click to browse for a tune file, or drag and drop a tune file here.")
+        self.table_list.addItem(item)
+        self.table_list.clearSelection()
+        self.table_list.setCurrentRow(-1)
+
+    def _on_table_list_item_clicked(self, item: QListWidgetItem) -> None:
+        if item.data(Qt.ItemDataRole.UserRole) == self.OPEN_TUNE_PLACEHOLDER_KEY:
+            self._open_tune_file()
 
     def _maybe_prompt_load_matching_log(self, tune_file: Path) -> None:
         if tune_file.suffix.lower() != ".msq":
@@ -3514,14 +4335,60 @@ class MainWindow(QMainWindow):
             return
 
         dest = Path(dest_path)
+        self._save_tune_to_path(dest)
+
+    def _save_tune_revision(self) -> None:
+        if self.tune_data is None or self.loaded_tune_path is None:
+            QMessageBox.warning(self, "No Tune Loaded", "Load a tune file before saving.")
+            return
+
+        if self.save_target_path is None:
+            # First save after loading a tune behaves like Save As.
+            self._save_tune_as()
+            return
+
+        self._save_tune_to_path(self.save_target_path)
+
+    def _save_tune_to_path(self, dest: Path) -> None:
+        if self.tune_data is None:
+            QMessageBox.warning(self, "No Tune Loaded", "Load a tune file before saving.")
+            return
+
+        pre_save_snapshot = self._snapshot_table_values(self.tune_data)
+        preserved_table_name = self._current_table_name()
+        preserved_row_index = self.selected_table_row_idx
+        preserved_undo_stack = [[float(value) for value in state] for state in self.row_edit_undo_stack]
+        preserved_active_snapshot = (
+            [float(value) for value in self._active_row_edit_snapshot]
+            if self._active_row_edit_snapshot is not None
+            else None
+        )
+        preserved_active_column = self._active_row_edit_column
+
+        self._apply_all_pending_row_edits_to_tune_data()
         try:
             self.tune_loader.save(self.tune_data, dest)
         except Exception as exc:  # noqa: BLE001
+            self._restore_table_values(self.tune_data, pre_save_snapshot)
             QMessageBox.critical(self, "Save Error", f"Could not save tune file:\n{exc}")
             return
 
+        # Persist staged edits to disk, but keep the in-memory workspace exactly as it was pre-save.
+        self._restore_table_values(self.tune_data, pre_save_snapshot)
+
         self.statusBar().showMessage(f"Saved tune: {dest.name}")
         self.loaded_tune_path = dest
+        self.save_target_path = dest
+
+        if self._current_table_name() == preserved_table_name and self.selected_table_row_idx == preserved_row_index:
+            self.row_edit_undo_stack = preserved_undo_stack
+            self._active_row_edit_snapshot = preserved_active_snapshot
+            self._active_row_edit_column = preserved_active_column
+        else:
+            self.row_edit_undo_stack = []
+            self._active_row_edit_snapshot = None
+            self._active_row_edit_column = None
+
         self._add_recent_tune_file(dest)
 
     def _open_log_file(self) -> None:
@@ -3561,20 +4428,88 @@ class MainWindow(QMainWindow):
         """Workspace text refresh - disabled since workspace is hidden by default."""
         pass
 
+    def _current_table_name(self) -> str | None:
+        if self.current_table is None or self.tune_data is None:
+            return None
+        for table_name, table in self.tune_data.tables.items():
+            if table is self.current_table:
+                return table_name
+        return None
+
+    @staticmethod
+    def _row_values_for_table(table: TableData, row_index: int | None = None) -> list[float]:
+        if table.rows == 1:
+            return [float(value) for value in table.values[0]]
+        if table.cols == 1:
+            return [float(row[0]) for row in table.values]
+        if row_index is None or row_index < 0 or row_index >= table.rows:
+            return []
+        return [float(value) for value in table.values[row_index]]
+
+    @staticmethod
+    def _values_differ(values_a: list[float], values_b: list[float], tolerance: float = 1e-9) -> bool:
+        if len(values_a) != len(values_b):
+            return True
+        return any(abs(float(a) - float(b)) > tolerance for a, b in zip(values_a, values_b))
+
+    def _stage_current_row_edits(self) -> None:
+        table_name = self._current_table_name()
+        if table_name is None or self.current_table is None or not self.pending_row_values:
+            return
+
+        table_state = self.pending_edits_per_table.setdefault(
+            table_name,
+            {"rows": {}, "one_d": None, "average_line_data": None},
+        )
+        rows_state = table_state.setdefault("rows", {})
+
+        if self._is_current_table_1d():
+            baseline_values = self._row_values_for_table(self.current_table)
+            staged_values = [float(value) for value in self.pending_row_values]
+            if self._values_differ(staged_values, baseline_values):
+                table_state["one_d"] = staged_values
+            else:
+                table_state["one_d"] = None
+            table_state["average_line_data"] = self.average_line_data
+        else:
+            if self.selected_table_row_idx is None:
+                return
+            baseline_values = self._row_values_for_table(self.current_table, self.selected_table_row_idx)
+            staged_values = [float(value) for value in self.pending_row_values]
+            if self._values_differ(staged_values, baseline_values):
+                rows_state[self.selected_table_row_idx] = staged_values
+            else:
+                rows_state.pop(self.selected_table_row_idx, None)
+            table_state["average_line_data"] = self.average_line_data
+
+        if not table_state.get("rows") and table_state.get("one_d") is None:
+            self.pending_edits_per_table.pop(table_name, None)
+
+    def _staged_row_values(self, table_name: str, table: TableData, row_index: int | None) -> list[float] | None:
+        state = self.pending_edits_per_table.get(table_name)
+        if not state:
+            return None
+
+        if table.rows == 1 or table.cols == 1:
+            one_d_values = state.get("one_d")
+            if isinstance(one_d_values, list):
+                return [float(value) for value in one_d_values]
+            return None
+
+        if row_index is None:
+            return None
+        rows_state = state.get("rows", {})
+        row_values = rows_state.get(row_index)
+        if isinstance(row_values, list):
+            return [float(value) for value in row_values]
+        return None
+
     def _on_table_selected(self, current_item: QListWidgetItem | None, previous_item: QListWidgetItem | None) -> None:
-        # Save the current selection and any pending edits before switching to a new table
-        if self.current_table is not None and self.selected_table_row_idx is not None and self.tune_data:
-            for name, table in self.tune_data.tables.items():
-                if table is self.current_table:
-                    self.selected_rows_per_table[name] = self.selected_table_row_idx
-                    # Preserve pending edits (unsaved row changes + average data)
-                    self.pending_edits_per_table[name] = {
-                        "pending_row_values": list(self.pending_row_values),
-                        "row_default_values": list(self.row_default_values),
-                        "average_line_data": self.average_line_data,
-                        "row_undo_stack": [list(s) for s in self.row_edit_undo_stack],
-                    }
-                    break
+        # Save current row edits/selection before switching away.
+        current_table_name = self._current_table_name()
+        self._stage_current_row_edits()
+        if current_table_name is not None and self.selected_table_row_idx is not None:
+            self.selected_rows_per_table[current_table_name] = self.selected_table_row_idx
 
         if not current_item or not self.tune_data:
             self.current_table = None
@@ -3623,17 +4558,11 @@ class MainWindow(QMainWindow):
             # Validate that the saved row index is still valid for this table
             if 0 <= saved_row_idx < table.rows:
                 self._load_selected_table_row(saved_row_idx)
-                # Restore any pending edits that were in progress
-                if table_name in self.pending_edits_per_table:
-                    saved = self.pending_edits_per_table[table_name]
-                    saved_pending = saved.get("pending_row_values", [])
-                    if len(saved_pending) == table.cols:
-                        self.pending_row_values = list(saved_pending)
-                        self.row_default_values = list(saved.get("row_default_values", saved_pending))
-                        self.average_line_data = saved.get("average_line_data")
-                        self.row_edit_undo_stack = [list(s) for s in saved.get("row_undo_stack", [])]
-                        self._refresh_table_row_editor()
-                        self._update_table_grid_row_visualization()
+
+        if table_name in self.pending_edits_per_table:
+            saved = self.pending_edits_per_table[table_name]
+            self.average_line_data = saved.get("average_line_data")
+            self._refresh_current_table_view()
 
     def _refresh_current_table_view(self) -> None:
         if not self.current_table:
@@ -3645,7 +4574,6 @@ class MainWindow(QMainWindow):
         matrix, display_x_axis, display_y_axis = self._table_display_state(table, x_axis, y_axis)
         row_count = len(matrix)
         col_count = len(matrix[0]) if matrix else 0
-        display_matrix = list(reversed(matrix))
         y_labels = list(reversed(self._header_labels(display_y_axis, row_count)))
         if (
             table.cols == 1
@@ -3659,40 +4587,218 @@ class MainWindow(QMainWindow):
         x_axis_title = self._axis_title("X", display_x_axis)
         y_axis_title = self._axis_title("Y", display_y_axis)
 
-        self.table_grid.clear()
-        self.table_grid.setRowCount(row_count + 1)
-        self.table_grid.setColumnCount(col_count)
-        self.table_grid.set_footer_rows(1)
-        self.table_grid.setVerticalHeaderLabels(y_labels + [""])
+        modified_matrix = self._table_matrix_with_pending_edits(table, x_axis, y_axis)
+        diff_cells = self._diff_cells(matrix, modified_matrix)
+
+        self._populate_table_grid(self.table_grid, matrix, x_labels, y_labels, diff_cells=diff_cells)
+        self._refresh_modified_table_preview(table, x_axis, y_axis, modified_matrix, diff_cells)
+        QTimer.singleShot(0, self._auto_size_table_and_row_viz)
+
+        units = table.units or "-"
+        display_name = self._get_tunerstudio_name(table.name) if self.show_tunerstudio_names else table.name
+        table_details = (
+            f"{table.name} | {row_count}x{col_count} | units: {units} | "
+            f"x(bottom): {x_axis_title} | y(left): {y_axis_title}"
+        )
+        self.table_meta.setText(display_name)
+        self.table_meta.setToolTip(table_details)
+        self.axis_meta.setText(f"Axes: X = {x_axis_title} | Y = {y_axis_title}")
+
+    def _populate_table_grid(
+        self,
+        grid: QTableWidget,
+        matrix: list[list[float]],
+        x_labels: list[str],
+        y_labels: list[str],
+        diff_cells: set[tuple[int, int]] | None = None,
+    ) -> None:
+        row_count = len(matrix)
+        col_count = len(matrix[0]) if matrix else 0
+        display_matrix = list(reversed(matrix))
+        diff_cells = diff_cells or set()
+
+        grid.clear()
+        grid.setRowCount(row_count + 1)
+        grid.setColumnCount(col_count)
+        if isinstance(grid, CopyPasteTableWidget):
+            grid.set_footer_rows(1)
+        grid.setVerticalHeaderLabels(y_labels + [""])
 
         minimum, maximum = self._matrix_min_max(display_matrix)
         span = max(maximum - minimum, 1e-9)
-
-        for r, row in enumerate(display_matrix):
-            for c, value in enumerate(row):
+        for display_row, row in enumerate(display_matrix):
+            source_row = row_count - 1 - display_row
+            for col, value in enumerate(row):
                 item = QTableWidgetItem(f"{value:g}")
-                item.setBackground(self._cell_color(value, minimum, span))
+                if (source_row, col) in diff_cells:
+                    item.setBackground(QColor(210, 65, 65, 210))
+                else:
+                    item.setBackground(self._cell_color(value, minimum, span))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table_grid.setItem(r, c, item)
+                grid.setItem(display_row, col, item)
 
         axis_row = row_count
-        for c, label in enumerate(x_labels):
+        for col, label in enumerate(x_labels):
             axis_item = QTableWidgetItem(label)
             axis_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             axis_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             axis_item.setBackground(QColor(60, 60, 60))
-            self.table_grid.setItem(axis_row, c, axis_item)
+            grid.setItem(axis_row, col, axis_item)
 
-        self.table_grid.resizeColumnsToContents()
-        self.table_grid.resizeRowsToContents()
-        QTimer.singleShot(0, self._auto_size_table_and_row_viz)
+        grid.resizeColumnsToContents()
+        grid.resizeRowsToContents()
 
-        units = table.units or "-"
-        self.table_meta.setText(
-            f"{table.name} | {row_count}x{col_count} | units: {units} | "
-            f"x(bottom): {x_axis_title} | y(left): {y_axis_title}"
-        )
-        self.axis_meta.setText(f"Axes: X = {x_axis_title} | Y = {y_axis_title}")
+    def _refresh_modified_table_preview(
+        self,
+        table: TableData,
+        x_axis: AxisVector | None,
+        y_axis: AxisVector | None,
+        modified_matrix: list[list[float]] | None = None,
+        diff_cells: set[tuple[int, int]] | None = None,
+    ) -> None:
+        base_matrix, display_x_axis, display_y_axis = self._table_display_state(table, x_axis, y_axis)
+        row_count = len(base_matrix)
+        col_count = len(base_matrix[0]) if base_matrix else 0
+        y_labels = list(reversed(self._header_labels(display_y_axis, row_count)))
+        if (
+            table.cols == 1
+            and table.rows > 1
+            and row_count == 1
+            and not self.transpose_checkbox.isChecked()
+            and not self.swap_axes_checkbox.isChecked()
+        ):
+            y_labels = ["Values"]
+        x_labels = self._header_labels(display_x_axis, col_count)
+
+        if modified_matrix is None:
+            modified_matrix = self._table_matrix_with_pending_edits(table, x_axis, y_axis)
+        if diff_cells is None:
+            diff_cells = self._diff_cells(base_matrix, modified_matrix)
+
+        if not diff_cells:
+            self.modified_table_meta.setVisible(False)
+            self.modified_table_grid.setVisible(False)
+            self.modified_table_grid.clear()
+            self.modified_table_grid.setRowCount(0)
+            self.modified_table_grid.setColumnCount(0)
+            return
+
+        display_name = self._get_tunerstudio_name(table.name) if self.show_tunerstudio_names else table.name
+        self.modified_table_meta.setText(f"{display_name} (modified)")
+        self.modified_table_meta.setVisible(True)
+        self.modified_table_grid.setVisible(True)
+        self._populate_table_grid(self.modified_table_grid, modified_matrix, x_labels, y_labels, diff_cells=diff_cells)
+
+    def _table_matrix_with_pending_edits(
+        self,
+        table: TableData,
+        x_axis: AxisVector | None,
+        y_axis: AxisVector | None,
+    ) -> list[list[float]]:
+        source_values = [[float(value) for value in row] for row in table.values]
+        table_name = None
+        if self.tune_data is not None:
+            for name, candidate in self.tune_data.tables.items():
+                if candidate is table:
+                    table_name = name
+                    break
+
+        if table_name is not None:
+            state = self.pending_edits_per_table.get(table_name, {})
+            one_d_values = state.get("one_d")
+            row_overrides = state.get("rows", {}) if isinstance(state.get("rows", {}), dict) else {}
+
+            if table.rows == 1 and isinstance(one_d_values, list) and len(one_d_values) == table.cols:
+                source_values[0] = [float(value) for value in one_d_values]
+            elif table.cols == 1 and isinstance(one_d_values, list) and len(one_d_values) == table.rows:
+                for row_index, value in enumerate(one_d_values):
+                    source_values[row_index][0] = float(value)
+            elif table.rows > 1 and table.cols > 1:
+                for row_index, row_values in row_overrides.items():
+                    if not isinstance(row_index, int) or not isinstance(row_values, list):
+                        continue
+                    if 0 <= row_index < table.rows and len(row_values) == table.cols:
+                        source_values[row_index] = [float(value) for value in row_values]
+
+        matrix, _, _ = self._table_display_state(table, x_axis, y_axis, source_values)
+        return matrix
+
+    @staticmethod
+    def _diff_cells(base_matrix: list[list[float]], modified_matrix: list[list[float]]) -> set[tuple[int, int]]:
+        if not base_matrix or not modified_matrix:
+            return set()
+
+        row_count = min(len(base_matrix), len(modified_matrix))
+        col_count = min(len(base_matrix[0]), len(modified_matrix[0]))
+        diff: set[tuple[int, int]] = set()
+        for row in range(row_count):
+            for col in range(col_count):
+                if abs(float(base_matrix[row][col]) - float(modified_matrix[row][col])) > 1e-9:
+                    diff.add((row, col))
+        return diff
+
+    @staticmethod
+    def _snapshot_table_values(tune_data: TuneData) -> dict[str, list[list[float]]]:
+        snapshots: dict[str, list[list[float]]] = {}
+        for table_name, table in tune_data.tables.items():
+            snapshots[table_name] = [[float(value) for value in row] for row in table.values]
+        return snapshots
+
+    @staticmethod
+    def _restore_table_values(tune_data: TuneData, snapshots: dict[str, list[list[float]]]) -> None:
+        for table_name, rows in snapshots.items():
+            table = tune_data.tables.get(table_name)
+            if table is None:
+                continue
+            if len(rows) != table.rows:
+                continue
+            for row_index, row_values in enumerate(rows):
+                if len(row_values) != table.cols:
+                    continue
+                table.values[row_index] = [float(value) for value in row_values]
+
+    def _apply_all_pending_row_edits_to_tune_data(self) -> None:
+        if self.tune_data is None:
+            return
+
+        self._stage_current_row_edits()
+
+        def apply_row_edit(table_name: str, row_index: int | None, pending_values: list[float]) -> None:
+            table = self.tune_data.tables.get(table_name)
+            if table is None or not pending_values:
+                return
+
+            if table.rows == 1:
+                if len(pending_values) == table.cols:
+                    table.values[0] = [float(value) for value in pending_values]
+                return
+
+            if table.cols == 1:
+                if len(pending_values) == table.rows:
+                    for r, value in enumerate(pending_values):
+                        table.values[r][0] = float(value)
+                return
+
+            if row_index is None or row_index < 0 or row_index >= table.rows:
+                return
+            if len(pending_values) != table.cols:
+                return
+            table.values[row_index] = [float(value) for value in pending_values]
+
+        for table_name, saved in self.pending_edits_per_table.items():
+            table = self.tune_data.tables.get(table_name)
+            if table is None:
+                continue
+
+            one_d_values = saved.get("one_d")
+            if isinstance(one_d_values, list):
+                apply_row_edit(table_name, 0, [float(value) for value in one_d_values])
+
+            row_overrides = saved.get("rows", {}) if isinstance(saved.get("rows", {}), dict) else {}
+            for row_index, row_values in row_overrides.items():
+                if not isinstance(row_index, int) or not isinstance(row_values, list):
+                    continue
+                apply_row_edit(table_name, row_index, [float(value) for value in row_values])
 
     def _table_content_width(self) -> int:
         frame = self.table_grid.frameWidth() * 2
@@ -3744,8 +4850,12 @@ class MainWindow(QMainWindow):
         table: TableData,
         x_axis: AxisVector | None,
         y_axis: AxisVector | None,
+        source_values: list[list[float]] | None = None,
     ) -> tuple[list[list[float]], AxisVector | None, AxisVector | None]:
-        matrix = [row[:] for row in table.values]
+        if source_values is None:
+            matrix = [row[:] for row in table.values]
+        else:
+            matrix = [row[:] for row in source_values]
         display_x_axis = x_axis
         display_y_axis = y_axis
 
@@ -3958,6 +5068,10 @@ class MainWindow(QMainWindow):
         predicted_values = [value for _, value in selected]
         weights = [1.0 / (distance + 0.05) for distance, _ in selected]
         return MainWindow._weighted_average(predicted_values, weights)
+
+    @staticmethod
+    def _round_ve_prediction(value: float) -> float:
+        return round(float(value), 1)
 
     @staticmethod
     def _default_data_dir() -> Path:

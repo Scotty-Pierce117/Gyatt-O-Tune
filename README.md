@@ -36,6 +36,33 @@ Notes:
 - The packaged build includes the app SVG asset used for the window icon.
 - Windows may still show SmartScreen warnings on unsigned executables. That is separate from portability.
 
+## Build a macOS app + installer (`.dmg`)
+
+You can build a native macOS app bundle and DMG installer from this repo.
+
+Important:
+
+- macOS builds must be created on a Mac. PyInstaller does not cross-compile macOS apps from Windows.
+
+On macOS:
+
+1. Create and activate a virtual environment:
+   - `python3 -m venv .venv`
+   - `source .venv/bin/activate`
+2. Install project + build dependency:
+   - `pip install -e .[build]`
+3. Run the macOS build script:
+   - `bash ./build_mac.sh`
+4. Outputs:
+   - `dist/Gyatt-O-Tune.app`
+   - `dist/Gyatt-O-Tune-macOS.dmg`
+
+Notes:
+
+- The DMG is a drag-and-drop installer image (`Gyatt-O-Tune.app` + `Applications` shortcut).
+- For distribution outside your own machine, you should code-sign and notarize with Apple Developer tools.
+- Unsigned builds may require right-click -> Open on first launch.
+
 ## Initial roadmap
 
 - Tune file import abstraction (MSQ support)
