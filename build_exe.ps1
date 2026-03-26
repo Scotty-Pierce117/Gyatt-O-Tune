@@ -48,7 +48,7 @@ if ($null -eq $iscc) {
         Write-Host "==> Building Windows installer with Inno Setup ($iscc)..." -ForegroundColor Cyan
         & $iscc "installer.iss"
         if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler failed (exit code $LASTEXITCODE)." }
-        Write-Host "==> Installer ready: dist\Gyatt-O-Tune-Setup-0.1.2.exe" -ForegroundColor Green
+        Write-Host "==> Installer ready: dist\Gyatt-O-Tune-Setup-0.1.3.exe" -ForegroundColor Green
     }
     finally {
         Pop-Location

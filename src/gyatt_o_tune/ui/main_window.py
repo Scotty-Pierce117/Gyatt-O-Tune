@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import re
+import ast
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDockWidget,
     QDialog,
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -214,16 +218,11 @@ class RowVisualizationPanel(QGroupBox):
         self._y_label_text = "Value"
         self._selected_point_text = "<span style='color:#f0f0f0'>Selected point: none</span>"
         self._stats_tooltip_text = ""
+        self.dynamic_scatter_items: dict[str, Any] = {}
         
         # Visibility toggles for different data series
         self._show_table = True
-        self._show_raw = True
-        self._show_corrected = True
         self._show_average = True
-        self._show_afr = True
-        self._show_afr_target = True
-        self._show_afr_error = True
-        self._show_knock = True
 
         layout = QVBoxLayout(self)
 
@@ -239,14 +238,8 @@ class RowVisualizationPanel(QGroupBox):
 
         self.table_curve = pg.PlotCurveItem(pen=pg.mkPen(255, 40, 40, width=5), name="Selected Row Data")
         self.table_scatter = pg.ScatterPlotItem(size=8, name="Selected Row Points")
-        self.raw_scatter = pg.ScatterPlotItem(pen=pg.mkPen(95, 140, 205, 170, width=1), brush=pg.mkBrush(95, 140, 205, 115), size=6, name="Raw VE1")
-        self.corrected_scatter = pg.ScatterPlotItem(pen=pg.mkPen(95, 175, 115, 170, width=1), brush=pg.mkBrush(95, 175, 115, 115), size=6, name="EGO Corrected VE")
         self.average_curve = pg.PlotCurveItem(pen=pg.mkPen(235, 170, 85, width=3), name="Predicted VE")
         self.average_scatter = pg.ScatterPlotItem(pen=pg.mkPen(235, 170, 85, 220, width=2), brush=pg.mkBrush(235, 170, 85, 200), size=8, name="Predicted VE Points")
-        self.afr_scatter = pg.ScatterPlotItem(pen=pg.mkPen(80, 155, 200, 170, width=1), brush=pg.mkBrush(80, 155, 200, 115), size=6, name="AFR")
-        self.afr_target_scatter = pg.ScatterPlotItem(pen=pg.mkPen(165, 120, 205, 170, width=1), brush=pg.mkBrush(165, 120, 205, 115), size=6, name="AFR Target")
-        self.afr_error_scatter = pg.ScatterPlotItem(pen=pg.mkPen(220, 170, 100, 170, width=1), brush=pg.mkBrush(220, 170, 100, 115), size=6, name="AFR Error")
-        self.knock_scatter = pg.ScatterPlotItem(pen=pg.mkPen(205, 95, 135, 170, width=1), brush=pg.mkBrush(205, 95, 135, 115), size=6, name="Knock In")
         self.selected_marker = pg.ScatterPlotItem(
             pen=pg.mkPen(255, 255, 255, 255, width=2),
             brush=pg.mkBrush(255, 225, 120, 255),
@@ -275,50 +268,14 @@ class RowVisualizationPanel(QGroupBox):
         self.check_table.toggled.connect(self._on_toggle_table)
         toggle_layout.addWidget(self.check_table)
         
-        self.check_raw = QCheckBox("Raw VE1")
-        self.check_raw.setChecked(True)
-        self.check_raw.toggled.connect(self._on_toggle_raw)
-        toggle_layout.addWidget(self.check_raw)
-        
-        self.check_corrected = QCheckBox("EGO Corrected")
-        self.check_corrected.setChecked(True)
-        self.check_corrected.toggled.connect(self._on_toggle_corrected)
-        toggle_layout.addWidget(self.check_corrected)
-        
         self.check_average = QCheckBox("Predicted VE")
         self.check_average.setChecked(True)
         self.check_average.toggled.connect(self._on_toggle_average)
         toggle_layout.addWidget(self.check_average)
 
-        self.check_afr = QCheckBox("AFR")
-        self.check_afr.setChecked(True)
-        self.check_afr.toggled.connect(self._on_toggle_afr)
-        toggle_layout.addWidget(self.check_afr)
-
-        self.check_afr_target = QCheckBox("AFR Target")
-        self.check_afr_target.setChecked(True)
-        self.check_afr_target.toggled.connect(self._on_toggle_afr_target)
-        toggle_layout.addWidget(self.check_afr_target)
-
-        self.check_afr_error = QCheckBox("AFR Error")
-        self.check_afr_error.setChecked(True)
-        self.check_afr_error.toggled.connect(self._on_toggle_afr_error)
-        toggle_layout.addWidget(self.check_afr_error)
-
-        self.check_knock = QCheckBox("Knock In")
-        self.check_knock.setChecked(True)
-        self.check_knock.toggled.connect(self._on_toggle_knock)
-        toggle_layout.addWidget(self.check_knock)
-
         self._check_by_series: dict[str, QCheckBox] = {
             "table": self.check_table,
-            "raw": self.check_raw,
-            "corrected": self.check_corrected,
             "average": self.check_average,
-            "afr": self.check_afr,
-            "afr_target": self.check_afr_target,
-            "afr_error": self.check_afr_error,
-            "knock": self.check_knock,
         }
         
         toggle_layout.addStretch()
@@ -436,38 +393,8 @@ class RowVisualizationPanel(QGroupBox):
         self._refresh_visibility()
         self._emit_visibility_changed()
 
-    def _on_toggle_raw(self, checked: bool) -> None:
-        self._show_raw = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_corrected(self, checked: bool) -> None:
-        self._show_corrected = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
     def _on_toggle_average(self, checked: bool) -> None:
         self._show_average = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_afr(self, checked: bool) -> None:
-        self._show_afr = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_afr_target(self, checked: bool) -> None:
-        self._show_afr_target = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_afr_error(self, checked: bool) -> None:
-        self._show_afr_error = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_knock(self, checked: bool) -> None:
-        self._show_knock = checked
         self._refresh_visibility()
         self._emit_visibility_changed()
 
@@ -479,26 +406,25 @@ class RowVisualizationPanel(QGroupBox):
         """Update plot item visibility based on checkboxes."""
         self.table_curve.show() if self._show_table else self.table_curve.hide()
         self.table_scatter.show() if self._show_table else self.table_scatter.hide()
-        self.raw_scatter.show() if self._show_raw else self.raw_scatter.hide()
-        self.corrected_scatter.show() if self._show_corrected else self.corrected_scatter.hide()
         self.average_curve.show() if self._show_average else self.average_curve.hide()
         self.average_scatter.show() if self._show_average else self.average_scatter.hide()
-        self.afr_scatter.show() if self._show_afr else self.afr_scatter.hide()
-        self.afr_target_scatter.show() if self._show_afr_target else self.afr_target_scatter.hide()
-        self.afr_error_scatter.show() if self._show_afr_error else self.afr_error_scatter.hide()
-        self.knock_scatter.show() if self._show_knock else self.knock_scatter.hide()
+        for scatter_item in self.dynamic_scatter_items.values():
+            scatter_item.show()
+        # Keep hidden series fully non-rendered and non-pickable.
+        self._refresh_point_styles()
         self._refresh_legend()
+
+    def _is_series_visible(self, series_id: str) -> bool:
+        visibility = {
+            "table": self._show_table,
+            "average": self._show_average,
+        }
+        return bool(visibility.get(series_id, True))
 
     def current_series_visibility(self) -> dict[str, bool]:
         return {
             "table": self._show_table,
-            "raw": self._show_raw,
-            "corrected": self._show_corrected,
             "average": self._show_average,
-            "afr": self._show_afr,
-            "afr_target": self._show_afr_target,
-            "afr_error": self._show_afr_error,
-            "knock": self._show_knock,
         }
 
     def configure_series_controls(
@@ -518,19 +444,14 @@ class RowVisualizationPanel(QGroupBox):
             check.blockSignals(False)
 
         self._show_table = self.check_table.isChecked()
-        self._show_raw = self.check_raw.isChecked()
-        self._show_corrected = self.check_corrected.isChecked()
         self._show_average = self.check_average.isChecked()
-        self._show_afr = self.check_afr.isChecked()
-        self._show_afr_target = self.check_afr_target.isChecked()
-        self._show_afr_error = self.check_afr_error.isChecked()
-        self._show_knock = self.check_knock.isChecked()
         self._refresh_visibility()
         self._emit_visibility_changed()
 
     def clear_visualization(self, title: str = "No data selected", stats_text: str = "") -> None:
         self._selected_point = None
         self._point_sets = []
+        self.dynamic_scatter_items = {}
         self._table_type = "generic"
         self._y_label_text = "Value"
         self._remove_legend()
@@ -575,14 +496,40 @@ class RowVisualizationPanel(QGroupBox):
     def _add_plot_items(self) -> None:
         self.plot.addItem(self.table_curve)
         self.plot.addItem(self.table_scatter)
-        self.plot.addItem(self.raw_scatter)
-        self.plot.addItem(self.corrected_scatter)
         self.plot.addItem(self.average_curve)
         self.plot.addItem(self.average_scatter)
-        self.plot.addItem(self.afr_scatter)
-        self.plot.addItem(self.afr_target_scatter)
-        self.plot.addItem(self.afr_error_scatter)
-        self.plot.addItem(self.knock_scatter)
+        self.dynamic_scatter_items = {}
+        dynamic_palette = [
+            (110, 210, 200),
+            (245, 200, 95),
+            (150, 190, 245),
+            (240, 135, 170),
+            (180, 220, 140),
+            (220, 170, 240),
+        ]
+        dynamic_series = [series for series in self._point_sets if str(series.get("series_id", "")).startswith("log::")]
+        for idx, series in enumerate(dynamic_series):
+            series_id = str(series.get("series_id"))
+            raw_color = series.get("scatter_color", "")
+            if isinstance(raw_color, str) and raw_color.startswith("#"):
+                try:
+                    qc = QColor(raw_color)
+                    color = (qc.red(), qc.green(), qc.blue())
+                except Exception:
+                    color = dynamic_palette[idx % len(dynamic_palette)]
+            else:
+                color = dynamic_palette[idx % len(dynamic_palette)]
+            opacity_pct = max(0, min(100, int(series.get("scatter_opacity", 70))))
+            brush_alpha = round(opacity_pct * 2.0)   # 0–200
+            pen_alpha = round(opacity_pct * 2.55)     # 0–255
+            scatter_item = pg.ScatterPlotItem(
+                pen=pg.mkPen(color[0], color[1], color[2], pen_alpha, width=1),
+                brush=pg.mkBrush(color[0], color[1], color[2], brush_alpha),
+                size=6,
+                name=str(series.get("name", series_id)),
+            )
+            self.dynamic_scatter_items[series_id] = scatter_item
+            self.plot.addItem(scatter_item)
         self.plot.addItem(self.selected_marker)
         self.plot.addItem(self.selected_point_overlay, ignoreBounds=True)
         self.plot.addItem(self.crosshair_vline, ignoreBounds=True)
@@ -612,12 +559,8 @@ class RowVisualizationPanel(QGroupBox):
         self.legend = None
 
     def _apply_item_z_order(self) -> None:
-        self.raw_scatter.setZValue(10)
-        self.corrected_scatter.setZValue(10)
-        self.afr_scatter.setZValue(10)
-        self.afr_target_scatter.setZValue(10)
-        self.afr_error_scatter.setZValue(10)
-        self.knock_scatter.setZValue(10)
+        for scatter_item in self.dynamic_scatter_items.values():
+            scatter_item.setZValue(12)
         self.average_curve.setZValue(30)
         self.average_scatter.setZValue(31)
         self.table_curve.setZValue(32)
@@ -644,18 +587,22 @@ class RowVisualizationPanel(QGroupBox):
         self.legend.clear()
         entries = [
             ("table", self.table_curve, "Selected Row", self._show_table),
-            ("raw", self.raw_scatter, "Raw VE1", self._show_raw),
-            ("corrected", self.corrected_scatter, "EGO Corrected VE", self._show_corrected),
             ("average", self.average_curve, "Predicted VE", self._show_average),
-            ("afr", self.afr_scatter, "AFR", self._show_afr),
-            ("afr_target", self.afr_target_scatter, "AFR Target", self._show_afr_target),
-            ("afr_error", self.afr_error_scatter, "AFR Error", self._show_afr_error),
-            ("knock", self.knock_scatter, "Knock In", self._show_knock),
         ]
 
         for series_id, item, label, is_enabled in entries:
             if is_enabled and self._series_has_points(series_id):
                 self.legend.addItem(item, label)
+
+        for series in self._point_sets:
+            series_id = str(series.get("series_id", ""))
+            if not series_id.startswith("log::"):
+                continue
+            item = self.dynamic_scatter_items.get(series_id)
+            if item is None:
+                continue
+            if self._series_has_points(series_id):
+                self.legend.addItem(item, str(series.get("name", series_id)))
 
     def _get_series(self, series_id: str) -> dict[str, Any] | None:
         for series in self._point_sets:
@@ -665,57 +612,33 @@ class RowVisualizationPanel(QGroupBox):
 
     def _refresh_point_styles(self) -> None:
         table_series = self._get_series("table")
-        raw_series = self._get_series("raw")
-        corrected_series = self._get_series("corrected")
         average_series = self._get_series("average")
-        afr_series = self._get_series("afr")
-        afr_target_series = self._get_series("afr_target")
-        afr_error_series = self._get_series("afr_error")
-        knock_series = self._get_series("knock")
 
-        if table_series is not None:
+        if table_series is not None and self._show_table:
             self.table_curve.setData(table_series["rpm"], table_series["ve"])
             self.table_scatter.setData(x=table_series["rpm"], y=table_series["ve"])
         else:
             self.table_curve.setData([], [])
             self.table_scatter.setData([], [])
 
-        if raw_series is not None:
-            self.raw_scatter.setData(x=raw_series["rpm"], y=raw_series["ve"])
-        else:
-            self.raw_scatter.setData([], [])
-
-        if corrected_series is not None:
-            self.corrected_scatter.setData(x=corrected_series["rpm"], y=corrected_series["ve"])
-        else:
-            self.corrected_scatter.setData([], [])
-
-        if average_series is not None:
+        if average_series is not None and self._show_average:
             self.average_curve.setData(average_series["rpm"], average_series["ve"])
             self.average_scatter.setData(x=average_series["rpm"], y=average_series["ve"])
         else:
             self.average_curve.setData([], [])
             self.average_scatter.setData([], [])
 
-        if afr_series is not None:
-            self.afr_scatter.setData(x=afr_series["rpm"], y=afr_series["ve"])
-        else:
-            self.afr_scatter.setData([], [])
-
-        if afr_target_series is not None:
-            self.afr_target_scatter.setData(x=afr_target_series["rpm"], y=afr_target_series["ve"])
-        else:
-            self.afr_target_scatter.setData([], [])
-
-        if afr_error_series is not None:
-            self.afr_error_scatter.setData(x=afr_error_series["rpm"], y=afr_error_series["ve"])
-        else:
-            self.afr_error_scatter.setData([], [])
-
-        if knock_series is not None:
-            self.knock_scatter.setData(x=knock_series["rpm"], y=knock_series["ve"])
-        else:
-            self.knock_scatter.setData([], [])
+        for series in self._point_sets:
+            series_id = str(series.get("series_id", ""))
+            if not series_id.startswith("log::"):
+                continue
+            item = self.dynamic_scatter_items.get(series_id)
+            if item is None:
+                continue
+            if self._is_series_visible(series_id):
+                item.setData(x=series.get("rpm", []), y=series.get("ve", []))
+            else:
+                item.setData([], [])
 
         self._refresh_selected_marker()
         self._refresh_legend()
@@ -727,6 +650,10 @@ class RowVisualizationPanel(QGroupBox):
             return
 
         series_id, index = self._selected_point
+        if not self._is_series_visible(series_id):
+            self.selected_marker.setData([], [])
+            self.selected_marker.hide()
+            return
         series = self._get_series(series_id)
         if series is None:
             self.selected_marker.setData([], [])
@@ -777,66 +704,37 @@ class RowVisualizationPanel(QGroupBox):
         return f"{value:.2f}{suffix}"
 
     def _format_selected_point_text(self, series: dict[str, Any], index: int) -> str:
-        def value_at(key: str) -> float | None:
-            values = series.get(key, [])
-            if isinstance(values, list) and 0 <= index < len(values):
-                return values[index]
-            return None
-
         name = str(series.get("name", "Point"))
-        rpm = float(series["rpm"][index])
-        map_val = float(series["map"][index])
-        ve = float(series["ve"][index])
-        ve_raw = value_at("ve_raw")
-        ve_scaled = value_at("ve_scaled")
-        afr = value_at("afr")
-        afr_predicted = value_at("afr_predicted")
-        afr_target = value_at("afr_target")
-        afr_error = value_at("afr_error")
-        time_elapsed = value_at("time_elapsed")
-        cranking_status = value_at("cranking_status")
-        warmup_enrichment = value_at("warmup_enrichment")
-        startup_enrichment = value_at("startup_enrichment")
-        ignition_advance = value_at("ignition_advance")
+        header = "Table Data Point Summary:" if name == "Selected Row Data" else f"{name} Point Summary:"
+        value_at_point: float | None = None
+        y_values = series.get("ve")
+        if isinstance(y_values, list) and 0 <= index < len(y_values):
+            try:
+                raw_value = float(y_values[index])
+                value_at_point = raw_value if raw_value == raw_value else None
+            except Exception:
+                value_at_point = None
 
-        lines = [f"Selected point ({name})"]
-        detail_rows: list[tuple[str, str]] = [
-            ("RPM:", f"{rpm:.1f}"),
-            ("MAP:", f"{map_val:.1f} kPa"),
-        ]
-        series_id = str(series.get("series_id"))
-        if series_id == "corrected":
-            if self._table_type == "ve" and ve_scaled is not None and ve_raw is not None and abs(float(ve_raw)) > 1e-9:
-                ve_offset_pct = ((float(ve_scaled) - float(ve_raw)) / float(ve_raw)) * 100.0
-                detail_rows.append(("Offset vs Raw VE:", f"{ve_offset_pct:+.2f}%"))
-            detail_rows.append(("VE scaled:", self._format_value(ve_scaled, '%')))
-            detail_rows.append(("VE unscaled:", self._format_value(ve_raw, '%')))
-        elif series_id == "table":
-            detail_rows.append(("Selected row value:", f"{ve:.2f}"))
-            if afr_predicted is not None:
-                detail_rows.append(("AFR predicted:", self._format_value(afr_predicted)))
-        elif series_id in {"afr", "afr_target", "afr_error", "knock"}:
-            detail_rows.append(("Value:", f"{ve:.2f}"))
-        else:
-            detail_rows.append(("VE:", f"{ve:.2f}%"))
-        detail_rows.append(("AFR Actual:", self._format_value(afr)))
-        detail_rows.append(("AFR target:", self._format_value(afr_target)))
-        detail_rows.append(("AFR error:", self._format_value(afr_error)))
-        if series_id == "knock":
-            detail_rows.append(("Time elapsed:", self._format_value(time_elapsed, ' s')))
-            if cranking_status is None:
-                detail_rows.append(("Cranking status:", "n/a"))
-            else:
-                detail_rows.append(("Cranking status:", "On" if float(cranking_status) >= 0.5 else "Off"))
-            detail_rows.append(("Warm-up enrichment:", self._format_value(warmup_enrichment, '%')))
-            detail_rows.append(("Start-up enrichment:", self._format_value(startup_enrichment, '%')))
-            detail_rows.append(("Ignition advance:", self._format_value(ignition_advance, ' deg')))
+        detail_rows: list[tuple[str, str]] = [(f"{name}:", self._format_value(value_at_point))]
+
+        extra_channels = series.get("extra_channels", {})
+        if isinstance(extra_channels, dict):
+            for channel_name in sorted(extra_channels.keys()):
+                channel_values = extra_channels.get(channel_name)
+                if isinstance(channel_values, list) and 0 <= index < len(channel_values):
+                    detail_rows.append((f"{channel_name}:", self._format_value(channel_values[index])))
+
+        detail_channels = series.get("detail_channels", {})
+        if isinstance(detail_channels, dict):
+            for channel_name in sorted(detail_channels.keys()):
+                channel_values = detail_channels.get(channel_name)
+                if isinstance(channel_values, list) and 0 <= index < len(channel_values):
+                    detail_rows.append((f"{channel_name}:", self._format_value(channel_values[index])))
 
         rows_html = "".join(
             f"<tr><td style='padding-right:10px'>{label}</td><td>{value}</td></tr>"
             for label, value in detail_rows
         )
-        header = lines[0] if lines else ""
         return (
             f"<span style='color:#f0f0f0'>"
             f"<b>{header}</b><br>"
@@ -895,6 +793,8 @@ class RowVisualizationPanel(QGroupBox):
         nearest: tuple[float, str, int] | None = None
         for series in self._point_sets:
             series_id = str(series.get("series_id", ""))
+            if not self._is_series_visible(series_id):
+                continue
             for index, (rpm, ve) in enumerate(zip(series.get("rpm", []), series.get("ve", []))):
                 dx_px = (float(rpm) - click_rpm) / x_per_px
                 dy_px = (float(ve) - click_val) / y_per_px
@@ -1076,36 +976,797 @@ class RowVisualizationPreferencesDialog(QDialog):
         return updated
 
 
-class StartupTuneDialog(QDialog):
-    """Startup picker for quickly loading a recent tune."""
+class TableLogChannelPreferencesDialog(QDialog):
+    """Per-table preferences with tabbed UI for table options and log channel picks."""
 
-    def __init__(self, recent_tune_files: list[Path], window_icon: QIcon, parent: QWidget | None = None) -> None:
+    _DEFAULT_SCATTER_PALETTE = [
+        "#6ED2C8",
+        "#F5C85F",
+        "#96BEF5",
+        "#F087AA",
+        "#B4DC8C",
+        "#DCAAF0",
+    ]
+
+    def __init__(
+        self,
+        table_names: list[str],
+        table_dimensions: dict[str, bool],
+        table_display_names: dict[str, str] | None,
+        log_channel_names: list[str],
+        current_preferences: dict[str, dict[str, dict[str, bool]]],
+        current_preferences_path: Path | None = None,
+        initial_table_name: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Welcome to Gyatt-O-Tune")
-        self.setModal(True)
-        self.resize(540, 420)
+        self.setWindowTitle("Row Data Preferences")
+        self.resize(980, 580)
 
-        self.selected_tune_path: Path | None = None
-        has_recent_tunes = False
+        self._all_table_names = sorted(table_names)
+        self._table_dimensions = dict(table_dimensions)
+        self._table_display_names = dict(table_display_names or {})
+        self._base_log_channel_names = list(log_channel_names)
+        self._custom_identifiers = self._normalize_custom_identifiers(current_preferences.get("__custom_identifiers__", {}))
+        self._log_channel_names = self._combined_identifier_names()
+        self._working_preferences = self._normalize_preferences(current_preferences)
+        self._point_cloud_preferences = self._normalize_point_cloud_preferences(current_preferences.get("__point_cloud__", {}))
+        self._current_preferences_path = current_preferences_path
+        self._cancel_requested = False
+        self._initial_table_name = initial_table_name if isinstance(initial_table_name, str) else None
+        self._active_point_cloud_source: str | None = None
 
         layout = QVBoxLayout(self)
 
+        header = QLabel(
+            "Configure per-table options and which log channels should be used for row visualization."
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        tabs = QTabWidget()
+
+        tune_tab = QWidget()
+        tune_tab_layout = QVBoxLayout(tune_tab)
+
+        table_filter_row = QHBoxLayout()
+        self.show_1d_check = QCheckBox("Show 1D tables")
+        self.show_1d_check.setChecked(True)
+        self.show_1d_check.toggled.connect(self._refresh_table_combo)
+        table_filter_row.addWidget(self.show_1d_check)
+        self.show_2d_check = QCheckBox("Show 2D tables")
+        self.show_2d_check.setChecked(True)
+        self.show_2d_check.toggled.connect(self._refresh_table_combo)
+        table_filter_row.addWidget(self.show_2d_check)
+        table_filter_row.addStretch(1)
+        self.tune_show_only_checked = QCheckBox("Enabled Identifiers Only")
+        self.tune_show_only_checked.setChecked(False)
+        self.tune_show_only_checked.toggled.connect(self._on_tune_filter_toggled)
+        table_filter_row.addWidget(self.tune_show_only_checked)
+        tune_tab_layout.addLayout(table_filter_row)
+
+        table_picker_row = QHBoxLayout()
+        table_picker_row.addWidget(QLabel("Table:"))
+        self.table_combo = QComboBox()
+        self.table_combo.currentIndexChanged.connect(self._on_table_changed)
+        table_picker_row.addWidget(self.table_combo, 1)
+        tune_tab_layout.addLayout(table_picker_row)
+
+        self.log_points_label = QLabel("Data log points for selected table")
+        tune_tab_layout.addWidget(self.log_points_label)
+
+        self.channels_table = QTableWidget()
+        self.channels_table.setColumnCount(5)
+        self.channels_table.setHorizontalHeaderLabels(["Identifier", "Display in Scatterplot", "Display in Summary", "Color", "Opacity"])
+        scatter_header = self.channels_table.horizontalHeaderItem(1)
+        if scatter_header is not None:
+            scatter_header.setToolTip("shows up as a point cloud in the graph")
+        like_data_header = self.channels_table.horizontalHeaderItem(2)
+        if like_data_header is not None:
+            like_data_header.setToolTip("Shows value in upper right hand corner of graph when the point is selected")
+        color_header = self.channels_table.horizontalHeaderItem(3)
+        if color_header is not None:
+            color_header.setToolTip("Scatterplot point color (only active when Display in Scatterplot is checked)")
+        opacity_header = self.channels_table.horizontalHeaderItem(4)
+        if opacity_header is not None:
+            opacity_header.setToolTip("Scatterplot point opacity 0–100% (only active when Display in Scatterplot is checked)")
+        self.channels_table.verticalHeader().setVisible(False)
+        self.channels_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        tune_tab_layout.addWidget(self.channels_table, 1)
+
+        tabs.addTab(tune_tab, "Tune Tables")
+
+        custom_tab = QWidget()
+        custom_tab_layout = QVBoxLayout(custom_tab)
+        custom_group = QGroupBox("Custom Identifiers")
+        custom_layout = QVBoxLayout(custom_group)
+        custom_inputs_row = QHBoxLayout()
+        custom_inputs_row.addWidget(QLabel("Name"))
+        self.custom_name_edit = QLineEdit()
+        self.custom_name_edit.setPlaceholderText("e.g. VE1_corr")
+        custom_inputs_row.addWidget(self.custom_name_edit, 1)
+        custom_inputs_row.addWidget(QLabel("Units"))
+        self.custom_units_edit = QLineEdit()
+        self.custom_units_edit.setPlaceholderText("e.g. %")
+        custom_inputs_row.addWidget(self.custom_units_edit, 1)
+        custom_layout.addLayout(custom_inputs_row)
+
+        expression_row = QHBoxLayout()
+        expression_row.addWidget(QLabel("Expression"))
+        self.custom_expression_edit = QLineEdit()
+        self.custom_expression_edit.setPlaceholderText("Use + - * / and up to 5 identifiers, e.g. ((EGO cor1)/100)*VE1")
+        expression_row.addWidget(self.custom_expression_edit, 1)
+        custom_layout.addLayout(expression_row)
+
+        custom_buttons_row = QHBoxLayout()
+        self.custom_add_update_button = QPushButton("Add / Update")
+        self.custom_add_update_button.clicked.connect(self._on_add_or_update_custom_identifier)
+        custom_buttons_row.addWidget(self.custom_add_update_button)
+        self.custom_remove_button = QPushButton("Remove Selected")
+        self.custom_remove_button.clicked.connect(self._on_remove_custom_identifier)
+        custom_buttons_row.addWidget(self.custom_remove_button)
+        custom_buttons_row.addStretch(1)
+        custom_layout.addLayout(custom_buttons_row)
+
+        self.custom_identifiers_table = QTableWidget()
+        self.custom_identifiers_table.setColumnCount(3)
+        self.custom_identifiers_table.setHorizontalHeaderLabels(["Identifier", "Units", "Expression"])
+        self.custom_identifiers_table.verticalHeader().setVisible(False)
+        self.custom_identifiers_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.custom_identifiers_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.custom_identifiers_table.itemSelectionChanged.connect(self._on_custom_identifier_selected)
+        custom_layout.addWidget(self.custom_identifiers_table)
+
+        custom_tab_layout.addWidget(custom_group, 1)
+        tabs.addTab(custom_tab, "Custom Identifiers")
+
+        log_tab = QWidget()
+        log_tab_layout = QVBoxLayout(log_tab)
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Scatterplot Points Data Log Name:"))
+        self.point_cloud_source_combo = QComboBox()
+        self.point_cloud_source_combo.addItems(self._log_channel_names)
+        self.point_cloud_source_combo.currentTextChanged.connect(self._on_point_cloud_source_changed)
+        source_row.addWidget(self.point_cloud_source_combo, 1)
+        log_tab_layout.addLayout(source_row)
+
+        cloud_filter_row = QHBoxLayout()
+        cloud_filter_row.addStretch(1)
+        self.cloud_show_only_checked = QCheckBox("Enabled Identifiers Only")
+        self.cloud_show_only_checked.setChecked(False)
+        self.cloud_show_only_checked.toggled.connect(self._on_cloud_filter_toggled)
+        cloud_filter_row.addWidget(self.cloud_show_only_checked)
+        log_tab_layout.addLayout(cloud_filter_row)
+
+        self.point_cloud_details_table = QTableWidget()
+        self.point_cloud_details_table.setColumnCount(2)
+        self.point_cloud_details_table.setHorizontalHeaderLabels(["Identifier", "Display in Summary"])
+        id_header = self.point_cloud_details_table.horizontalHeaderItem(0)
+        if id_header is not None:
+            id_header.setToolTip("Channel name as it appears in the data log")
+        detail_header = self.point_cloud_details_table.horizontalHeaderItem(1)
+        if detail_header is not None:
+            detail_header.setToolTip("Shows value in upper right hand corner of graph when the point is selected")
+        self.point_cloud_details_table.verticalHeader().setVisible(False)
+        self.point_cloud_details_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        log_tab_layout.addWidget(self.point_cloud_details_table, 1)
+
+        tabs.addTab(log_tab, "Scatterplot Points")
+        layout.addWidget(tabs, 1)
+
+        button_row = QHBoxLayout()
+        save_file_button = QPushButton("Save Preferences As...")
+        save_file_button.clicked.connect(self._save_to_json_file)
+        button_row.addWidget(save_file_button)
+
+        load_file_button = QPushButton("Load Preferences...")
+        load_file_button.clicked.connect(self._load_from_json_file)
+        button_row.addWidget(load_file_button)
+
+        button_row.addStretch(1)
+        dialog_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        cancel_button = dialog_buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if cancel_button is not None:
+            cancel_button.clicked.connect(self._on_cancel_clicked)
+        dialog_buttons.accepted.connect(self.accept)
+        dialog_buttons.rejected.connect(self.reject)
+        button_row.addWidget(dialog_buttons)
+        layout.addLayout(button_row)
+
+        self._refresh_table_combo()
+        if self._log_channel_names:
+            self._active_point_cloud_source = self._log_channel_names[0]
+            self._populate_point_cloud_targets(self._active_point_cloud_source)
+        self._refresh_custom_identifier_table()
+
+    def _on_cancel_clicked(self) -> None:
+        self._cancel_requested = True
+
+    def _on_scatter_checkbox_changed(self, row: int, checked: bool) -> None:
+        """Enable/disable color+opacity controls and refresh filter visibility."""
+        enabled = bool(checked)
+        color_btn = self.channels_table.cellWidget(row, 3)
+        opacity_spin = self.channels_table.cellWidget(row, 4)
+        if color_btn is not None:
+            color_btn.setEnabled(enabled)
+        if opacity_spin is not None:
+            opacity_spin.setEnabled(enabled)
+        if self.tune_show_only_checked.isChecked():
+            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
+            self.channels_table.setRowHidden(row, not (enabled or selected_on))
+
+    def _on_selected_checkbox_changed(self, row: int, checked: bool) -> None:
+        """Refresh tune-table row visibility when summary checkbox changes."""
+        _ = checked
+        if self.tune_show_only_checked.isChecked():
+            scatter_on = self._table_checkbox_checked(self.channels_table, row, 1)
+            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
+            self.channels_table.setRowHidden(row, not (scatter_on or selected_on))
+
+    def _on_cloud_checkbox_changed(self, row: int, checked: bool) -> None:
+        """Refresh scatterplot-points row visibility when checkbox changes."""
+        if self.cloud_show_only_checked.isChecked():
+            self.point_cloud_details_table.setRowHidden(row, not bool(checked))
+
+    def _make_centered_checkbox(self, checked: bool, on_changed: Callable[[bool], None] | None = None) -> QWidget:
+        """Create a truly centered checkbox cell widget for QTableWidget."""
+        box = QCheckBox()
+        box.setChecked(bool(checked))
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(box)
+        holder.setProperty("checkbox", box)
+        if on_changed is not None:
+            box.toggled.connect(on_changed)
+        return holder
+
+    @staticmethod
+    def _table_checkbox_checked(table: QTableWidget, row: int, column: int) -> bool:
+        widget = table.cellWidget(row, column)
+        if widget is None:
+            return False
+        box = widget.property("checkbox")
+        if isinstance(box, QCheckBox):
+            return box.isChecked()
+        return False
+
+    def _on_tune_filter_toggled(self, checked: bool) -> None:
+        """Show or hide rows based on whether any checkbox is set."""
+        for row in range(self.channels_table.rowCount()):
+            scatter_on = self._table_checkbox_checked(self.channels_table, row, 1)
+            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
+            self.channels_table.setRowHidden(row, checked and not (scatter_on or selected_on))
+
+    def _on_cloud_filter_toggled(self, checked: bool) -> None:
+        """Show or hide rows in the Scatterplot Points table based on checkbox state."""
+        for row in range(self.point_cloud_details_table.rowCount()):
+            is_checked = self._table_checkbox_checked(self.point_cloud_details_table, row, 1)
+            self.point_cloud_details_table.setRowHidden(row, checked and not is_checked)
+
+    def _make_color_button(self, hex_color: str) -> QPushButton:
+        """Create a color-swatch button that opens a color picker on click."""
+        qc = QColor(hex_color)
+        lum = 0.299 * qc.red() + 0.587 * qc.green() + 0.114 * qc.blue()
+        fg = "#000000" if lum > 128 else "#ffffff"
+        btn = QPushButton(hex_color)
+        btn.setStyleSheet(f"background-color: {hex_color}; color: {fg}; border: 1px solid #666;")
+        btn.setProperty("scatter_color", hex_color)
+
+        def _pick_color(checked: bool = False, button: QPushButton = btn) -> None:
+            current = QColor(str(button.property("scatter_color") or "#6ED2C8"))
+            chosen = QColorDialog.getColor(current, self, "Pick Scatter Color")
+            if not chosen.isValid():
+                return
+            new_hex = chosen.name()
+            lum2 = 0.299 * chosen.red() + 0.587 * chosen.green() + 0.114 * chosen.blue()
+            fg2 = "#000000" if lum2 > 128 else "#ffffff"
+            button.setStyleSheet(f"background-color: {new_hex}; color: {fg2}; border: 1px solid #666;")
+            button.setText(new_hex)
+            button.setProperty("scatter_color", new_hex)
+
+        btn.clicked.connect(_pick_color)
+        return btn
+
+    def reject(self) -> None:  # type: ignore[override]
+        # Closing the dialog applies changes unless the user explicitly clicked Cancel.
+        if self._cancel_requested:
+            super().reject()
+            return
+        self.accept()
+
+    @staticmethod
+    def _normalize_preferences(raw: dict[str, Any]) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for table_name, channels in raw.items():
+            if table_name in {"__point_cloud__", "__custom_identifiers__"}:
+                continue
+            if not isinstance(channels, dict):
+                continue
+            normalized[table_name] = {}
+            for channel_name, prefs in channels.items():
+                if not isinstance(prefs, dict):
+                    continue
+                normalized[table_name][channel_name] = {
+                    "show_in_scatterplot": bool(prefs.get("show_in_scatterplot", False)),
+                    "show_when_point_selected": bool(prefs.get("show_when_point_selected", False)),
+                    "scatter_color": str(prefs.get("scatter_color", "")),
+                    "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                }
+        return normalized
+
+    @staticmethod
+    def _normalize_custom_identifiers(raw: Any) -> dict[str, dict[str, str]]:
+        normalized: dict[str, dict[str, str]] = {}
+        if not isinstance(raw, dict):
+            return normalized
+        for name, cfg in raw.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(cfg, dict):
+                continue
+            expression = str(cfg.get("expression", "")).strip()
+            if not expression:
+                continue
+            normalized[name.strip()] = {
+                "expression": expression,
+                "units": str(cfg.get("units", "")).strip(),
+            }
+        return normalized
+
+    def _combined_identifier_names(self) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for name in self._base_log_channel_names + list(self._custom_identifiers.keys()):
+            if name in seen:
+                continue
+            seen.add(name)
+            merged.append(name)
+        return merged
+
+    def _extract_identifiers_from_expression(self, expression: str, candidates: list[str]) -> tuple[list[str], str | None]:
+        expr = expression
+        found: list[str] = []
+        by_len = sorted([name for name in candidates if name], key=len, reverse=True)
+        for idx, identifier in enumerate(by_len):
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])")
+            if pattern.search(expr):
+                token = f"__id{idx}__"
+                expr = pattern.sub(token, expr)
+                found.append(identifier)
+        scrubbed = re.sub(r"__id\d+__", "", expr)
+        scrubbed = re.sub(r"[0-9eE+\-*/().\s]", "", scrubbed)
+        if scrubbed:
+            return [], f"Expression contains unknown identifier content: '{scrubbed}'"
+        return found, None
+
+    def _refresh_identifier_lists(self, preserve_source: str | None = None) -> None:
+        self._save_current_table_state()
+        self._save_point_cloud_state(self._active_point_cloud_source)
+        self._log_channel_names = self._combined_identifier_names()
+        current_source = preserve_source if preserve_source is not None else self.point_cloud_source_combo.currentText()
+        self.point_cloud_source_combo.blockSignals(True)
+        self.point_cloud_source_combo.clear()
+        self.point_cloud_source_combo.addItems(self._log_channel_names)
+        if current_source and current_source in self._log_channel_names:
+            self.point_cloud_source_combo.setCurrentText(current_source)
+        elif self._log_channel_names:
+            self.point_cloud_source_combo.setCurrentIndex(0)
+        self.point_cloud_source_combo.blockSignals(False)
+        self._active_point_cloud_source = self.point_cloud_source_combo.currentText() if self._log_channel_names else None
+        active = self._active_table_name()
+        if active:
+            self._populate_channels_for_table(active)
+        if self._active_point_cloud_source:
+            self._populate_point_cloud_targets(self._active_point_cloud_source)
+
+    def _refresh_custom_identifier_table(self) -> None:
+        names = sorted(self._custom_identifiers.keys())
+        self.custom_identifiers_table.setRowCount(len(names))
+        for row, name in enumerate(names):
+            cfg = self._custom_identifiers.get(name, {})
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.custom_identifiers_table.setItem(row, 0, name_item)
+            units_item = QTableWidgetItem(str(cfg.get("units", "")))
+            units_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.custom_identifiers_table.setItem(row, 1, units_item)
+            expr_item = QTableWidgetItem(str(cfg.get("expression", "")))
+            expr_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.custom_identifiers_table.setItem(row, 2, expr_item)
+        self.custom_identifiers_table.resizeColumnsToContents()
+
+    def _on_custom_identifier_selected(self) -> None:
+        row = self.custom_identifiers_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.custom_identifiers_table.item(row, 0)
+        if name_item is None:
+            return
+        name = name_item.text()
+        cfg = self._custom_identifiers.get(name, {})
+        self.custom_name_edit.setText(name)
+        self.custom_units_edit.setText(str(cfg.get("units", "")))
+        self.custom_expression_edit.setText(str(cfg.get("expression", "")))
+
+    def _on_add_or_update_custom_identifier(self) -> None:
+        name = self.custom_name_edit.text().strip()
+        units = self.custom_units_edit.text().strip()
+        expression = self.custom_expression_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Custom Identifier", "Name is required.")
+            return
+        if not expression:
+            QMessageBox.warning(self, "Custom Identifier", "Expression is required.")
+            return
+        if name in self._base_log_channel_names:
+            QMessageBox.warning(self, "Custom Identifier", "Name conflicts with an existing log identifier.")
+            return
+
+        candidates = [n for n in self._combined_identifier_names() if n != name]
+        found, error = self._extract_identifiers_from_expression(expression, candidates)
+        if error is not None:
+            QMessageBox.warning(self, "Custom Identifier", error)
+            return
+        if len(set(found)) == 0:
+            QMessageBox.warning(self, "Custom Identifier", "Expression must reference at least one identifier.")
+            return
+        if len(set(found)) > 5:
+            QMessageBox.warning(self, "Custom Identifier", "Expression can reference at most 5 identifiers.")
+            return
+        if name in found:
+            QMessageBox.warning(self, "Custom Identifier", "Expression cannot directly reference itself.")
+            return
+
+        self._custom_identifiers[name] = {"expression": expression, "units": units}
+        self._refresh_custom_identifier_table()
+        self._refresh_identifier_lists(preserve_source=self._active_point_cloud_source)
+
+    def _on_remove_custom_identifier(self) -> None:
+        row = self.custom_identifiers_table.currentRow()
+        if row < 0:
+            return
+        name_item = self.custom_identifiers_table.item(row, 0)
+        if name_item is None:
+            return
+        name = name_item.text()
+        self._custom_identifiers.pop(name, None)
+        for table_name, table_prefs in list(self._working_preferences.items()):
+            if isinstance(table_prefs, dict) and name in table_prefs:
+                table_prefs.pop(name, None)
+                self._working_preferences[table_name] = table_prefs
+        for source_name, targets in list(self._point_cloud_preferences.items()):
+            if isinstance(targets, dict) and name in targets:
+                targets.pop(name, None)
+                self._point_cloud_preferences[source_name] = targets
+        if name in self._point_cloud_preferences:
+            self._point_cloud_preferences.pop(name, None)
+        self._refresh_custom_identifier_table()
+        self._refresh_identifier_lists(preserve_source=self._active_point_cloud_source)
+
+    @staticmethod
+    def _normalize_point_cloud_preferences(raw: dict[str, dict[str, bool]]) -> dict[str, dict[str, bool]]:
+        normalized: dict[str, dict[str, bool]] = {}
+        if not isinstance(raw, dict):
+            return normalized
+        for source_name, targets in raw.items():
+            if not isinstance(targets, dict):
+                continue
+            normalized[source_name] = {target_name: bool(enabled) for target_name, enabled in targets.items()}
+        return normalized
+
+    def _refresh_table_combo(self) -> None:
+        previous = self._active_table_name()
+        preferred_initial = self._initial_table_name
+        include_1d = self.show_1d_check.isChecked()
+        include_2d = self.show_2d_check.isChecked()
+
+        filtered: list[str] = []
+        for table_name in self._all_table_names:
+            is_1d = bool(self._table_dimensions.get(table_name, False))
+            if is_1d and not include_1d:
+                continue
+            if (not is_1d) and not include_2d:
+                continue
+            filtered.append(table_name)
+
+        self.table_combo.blockSignals(True)
+        self.table_combo.clear()
+        for table_name in filtered:
+            self.table_combo.addItem(self._display_name_for_table(table_name), table_name)
+        if filtered:
+            if previous in filtered:
+                index = self.table_combo.findData(previous)
+                if index >= 0:
+                    self.table_combo.setCurrentIndex(index)
+                else:
+                    self.table_combo.setCurrentIndex(0)
+            elif preferred_initial in filtered:
+                index = self.table_combo.findData(preferred_initial)
+                if index >= 0:
+                    self.table_combo.setCurrentIndex(index)
+                else:
+                    self.table_combo.setCurrentIndex(0)
+            else:
+                self.table_combo.setCurrentIndex(0)
+            self._initial_table_name = None
+        self.table_combo.blockSignals(False)
+
+        if filtered:
+            self._on_table_changed(self.table_combo.currentIndex())
+        else:
+            self.channels_table.clearContents()
+            self.channels_table.setRowCount(0)
+            self.log_points_label.setText("No tables match the current filters.")
+
+    def _active_table_name(self) -> str | None:
+        table_name = self.table_combo.currentData()
+        return str(table_name) if isinstance(table_name, str) and table_name else None
+
+    def _display_name_for_table(self, table_name: str) -> str:
+        return self._table_display_names.get(table_name, table_name)
+
+    def _save_current_table_state(self) -> None:
+        table_name = self._active_table_name()
+        if table_name is None:
+            return
+
+        table_prefs = self._working_preferences.setdefault(table_name, {})
+        for row_index in range(self.channels_table.rowCount()):
+            channel_item = self.channels_table.item(row_index, 0)
+            if channel_item is None:
+                continue
+            channel_name = channel_item.text()
+            show_scatter = self._table_checkbox_checked(self.channels_table, row_index, 1)
+            show_selected = self._table_checkbox_checked(self.channels_table, row_index, 2)
+            color_btn = self.channels_table.cellWidget(row_index, 3)
+            opacity_spin = self.channels_table.cellWidget(row_index, 4)
+            scatter_color = str(color_btn.property("scatter_color") or "") if color_btn is not None else ""
+            scatter_opacity = int(opacity_spin.value()) if opacity_spin is not None else 70
+            table_prefs[channel_name] = {
+                "show_in_scatterplot": show_scatter,
+                "show_when_point_selected": show_selected,
+                "scatter_color": scatter_color,
+                "scatter_opacity": scatter_opacity,
+            }
+
+    def _populate_channels_for_table(self, table_name: str) -> None:
+        table_prefs = self._working_preferences.get(table_name, {})
+        self.log_points_label.setText(f"Data log points for table: {self._display_name_for_table(table_name)}")
+        self.channels_table.blockSignals(True)
+        self.channels_table.clearContents()
+        self.channels_table.setRowCount(len(self._log_channel_names))
+        filter_on = self.tune_show_only_checked.isChecked()
+
+        for row_index, channel_name in enumerate(self._log_channel_names):
+            pref = table_prefs.get(channel_name, {})
+            name_item = QTableWidgetItem(channel_name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.channels_table.setItem(row_index, 0, name_item)
+
+            scatter_checked = bool(pref.get("show_in_scatterplot", False))
+            scatter_widget = self._make_centered_checkbox(
+                scatter_checked,
+                on_changed=lambda checked, r=row_index: self._on_scatter_checkbox_changed(r, checked),
+            )
+            self.channels_table.setCellWidget(row_index, 1, scatter_widget)
+
+            selected_checked = bool(pref.get("show_when_point_selected", False))
+            selected_widget = self._make_centered_checkbox(
+                selected_checked,
+                on_changed=lambda checked, r=row_index: self._on_selected_checkbox_changed(r, checked),
+            )
+            self.channels_table.setCellWidget(row_index, 2, selected_widget)
+
+            default_hex = self._DEFAULT_SCATTER_PALETTE[row_index % len(self._DEFAULT_SCATTER_PALETTE)]
+            hex_color = str(pref.get("scatter_color", "")) or default_hex
+            color_btn = self._make_color_button(hex_color)
+            color_btn.setEnabled(scatter_checked)
+            self.channels_table.setCellWidget(row_index, 3, color_btn)
+
+            opacity_spin = QSpinBox()
+            opacity_spin.setRange(0, 100)
+            opacity_spin.setSuffix(" %")
+            opacity_spin.setValue(max(0, min(100, int(pref.get("scatter_opacity", 70)))))
+            opacity_spin.setEnabled(scatter_checked)
+            self.channels_table.setCellWidget(row_index, 4, opacity_spin)
+
+            if filter_on and not (scatter_checked or selected_checked):
+                self.channels_table.setRowHidden(row_index, True)
+
+        self.channels_table.resizeColumnsToContents()
+        self.channels_table.setColumnWidth(3, 90)
+        self.channels_table.setColumnWidth(4, 100)
+        self.channels_table.blockSignals(False)
+
+    def _on_table_changed(self, index: int) -> None:
+        _ = index
+        self._save_current_table_state()
+        table_name = self._active_table_name()
+        if table_name:
+            self._populate_channels_for_table(table_name)
+
+    def preferences(self) -> dict[str, dict[str, dict[str, bool]]]:
+        self._save_current_table_state()
+        self._save_point_cloud_state()
+        merged = self._normalize_preferences(self._working_preferences)
+        merged["__point_cloud__"] = self._normalize_point_cloud_preferences(self._point_cloud_preferences)
+        merged["__custom_identifiers__"] = self._normalize_custom_identifiers(self._custom_identifiers)
+        return merged
+
+    def _save_point_cloud_state(self, source_name: str | None = None) -> None:
+        active_source = source_name if source_name is not None else self._active_point_cloud_source
+        if active_source is None:
+            active_source = self.point_cloud_source_combo.currentText()
+        source_name = str(active_source)
+        if not source_name:
+            return
+        source_prefs = self._point_cloud_preferences.setdefault(source_name, {})
+        for row_index in range(self.point_cloud_details_table.rowCount()):
+            name_item = self.point_cloud_details_table.item(row_index, 0)
+            if name_item is None:
+                continue
+            target_name = name_item.text()
+            source_prefs[target_name] = self._table_checkbox_checked(self.point_cloud_details_table, row_index, 1)
+
+    def _populate_point_cloud_targets(self, source_name: str) -> None:
+        source_prefs = self._point_cloud_preferences.get(source_name, {})
+        targets = [name for name in self._log_channel_names if name != source_name]
+        filter_on = self.cloud_show_only_checked.isChecked()
+        self.point_cloud_details_table.blockSignals(True)
+        self.point_cloud_details_table.clearContents()
+        self.point_cloud_details_table.setRowCount(len(targets))
+        for row_index, target_name in enumerate(targets):
+            name_item = QTableWidgetItem(target_name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.point_cloud_details_table.setItem(row_index, 0, name_item)
+            checked = bool(source_prefs.get(target_name, False))
+            check_widget = self._make_centered_checkbox(
+                checked,
+                on_changed=lambda state, r=row_index: self._on_cloud_checkbox_changed(r, state),
+            )
+            self.point_cloud_details_table.setCellWidget(row_index, 1, check_widget)
+            if filter_on and not checked:
+                self.point_cloud_details_table.setRowHidden(row_index, True)
+        self.point_cloud_details_table.resizeColumnsToContents()
+        self.point_cloud_details_table.blockSignals(False)
+
+    def _on_point_cloud_source_changed(self, source_name: str) -> None:
+        self._save_point_cloud_state(self._active_point_cloud_source)
+        self._active_point_cloud_source = source_name
+        if source_name:
+            self._populate_point_cloud_targets(source_name)
+
+    def _save_to_json_file(self) -> None:
+        self._save_current_table_state()
+        self._save_point_cloud_state()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Row Data Preferences",
+            "row_data_preferences.json",
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        payload = {
+            "version": 1,
+            "tables": self.preferences(),
+        }
+        try:
+            Path(file_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Save Preferences Error", f"Could not save preferences:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Preferences Saved", f"Saved preferences to:\n{file_path}")
+
+    def _load_from_json_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Row Data Preferences",
+            "",
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        source_path = Path(file_path)
+        load_path = source_path
+
+        if self._current_preferences_path is not None:
+            try:
+                self._current_preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                self._current_preferences_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+                load_path = self._current_preferences_path
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(
+                    self,
+                    "Load Preferences Error",
+                    f"Could not apply selected file as current preferences:\n{exc}",
+                )
+                return
+
+        try:
+            payload = json.loads(load_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Load Preferences Error", f"Could not read preferences file:\n{exc}")
+            return
+
+        loaded_tables = payload.get("tables", payload)
+        if not isinstance(loaded_tables, dict):
+            QMessageBox.critical(self, "Load Preferences Error", "Invalid preferences format.")
+            return
+
+        self._working_preferences = self._normalize_preferences(loaded_tables)
+        self._point_cloud_preferences = self._normalize_point_cloud_preferences(loaded_tables.get("__point_cloud__", {}))
+        self._custom_identifiers = self._normalize_custom_identifiers(loaded_tables.get("__custom_identifiers__", {}))
+        self._refresh_custom_identifier_table()
+        self._refresh_identifier_lists(preserve_source=self._active_point_cloud_source)
+        active = self._active_table_name()
+        if active:
+            self._populate_channels_for_table(active)
+        source_name = self.point_cloud_source_combo.currentText()
+        if source_name:
+            self._active_point_cloud_source = source_name
+            self._populate_point_cloud_targets(source_name)
+        QMessageBox.information(self, "Preferences Loaded", f"Loaded preferences from:\n{file_path}")
+
+
+class StartupTuneDialog(QDialog):
+    """Startup picker for quickly loading a recent tune."""
+
+    def __init__(
+        self,
+        recent_tune_files: list[Path],
+        window_icon: QIcon,
+        default_browse_dir: Path | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Gyatt-O-Tune")
+        self.setModal(True)
+        self.resize(620, 460)
+
+        self.selected_tune_path: Path | None = None
+        self.default_browse_dir = default_browse_dir
+        has_recent_tunes = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        self.setStyleSheet(
+            "QDialog { background: #14161c; }"
+            "QLabel { color: #e7ebf3; }"
+            "QListWidget { background: #1c1f27; color: #f0f3fa; border: 1px solid #2c3240; border-radius: 8px; }"
+            "QPushButton { background: #2d5ecf; color: white; border-radius: 6px; padding: 7px 12px; }"
+            "QPushButton:hover { background: #3873f0; }"
+            "QPushButton:disabled { background: #4a5060; color: #c1c7d8; }"
+        )
+
         icon_label = QLabel()
         if not window_icon.isNull():
-            icon_label.setPixmap(window_icon.pixmap(72, 72))
+            icon_label.setPixmap(window_icon.pixmap(82, 82))
         icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(icon_label)
 
-        title = QLabel("Load a recent tune")
+        title = QLabel("Gyatt-O-Tune")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title.setStyleSheet("font-size: 24px; font-weight: 700;")
         layout.addWidget(title)
 
-        subtitle = QLabel("Choose a recent tune to continue, or start with an empty workspace.")
+        subtitle = QLabel("Open a recent tune or browse to select a tune file.")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #c7cedd;")
         layout.addWidget(subtitle)
 
+        recent_title = QLabel("Recent Tunes")
+        recent_title.setStyleSheet("font-size: 13px; font-weight: 600;")
+        layout.addWidget(recent_title)
+
         self.recent_list = QListWidget()
+        self.recent_list.setAlternatingRowColors(True)
         for file_path in recent_tune_files:
             if not file_path.exists():
                 continue
@@ -1119,20 +1780,45 @@ class StartupTuneDialog(QDialog):
             placeholder = QListWidgetItem("No recent tune files found")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             self.recent_list.addItem(placeholder)
+        else:
+            self.recent_list.setCurrentRow(0)
 
         self.recent_list.itemDoubleClicked.connect(self._open_selected)
+        self.recent_list.currentItemChanged.connect(self._update_open_button_state)
         layout.addWidget(self.recent_list, 1)
 
         button_row = QHBoxLayout()
-        self.open_button = QPushButton("Open Selected Tune")
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self._browse_for_tune)
+        button_row.addWidget(browse_button)
+
+        self.open_button = QPushButton("Open")
         self.open_button.clicked.connect(self._open_selected)
         self.open_button.setEnabled(has_recent_tunes)
         button_row.addWidget(self.open_button)
 
-        start_empty = QPushButton("Start Empty")
-        start_empty.clicked.connect(self.reject)
-        button_row.addWidget(start_empty)
+        quit_button = QPushButton("Quit")
+        quit_button.clicked.connect(self.reject)
+        button_row.addWidget(quit_button)
         layout.addLayout(button_row)
+
+    def _update_open_button_state(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        path_str = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        self.open_button.setEnabled(isinstance(path_str, str))
+
+    def _browse_for_tune(self) -> None:
+        start_dir = str(self.default_browse_dir) if self.default_browse_dir is not None else ""
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open MegaSquirt Tune File",
+            start_dir,
+            "Tune Files (*.msq *.ini *.txt);;All Files (*.*)",
+        )
+        if not selected_path:
+            return
+
+        self.selected_tune_path = Path(selected_path)
+        self.accept()
 
     def _open_selected(self, _item: QListWidgetItem | None = None) -> None:
         current_item = self.recent_list.currentItem()
@@ -1161,9 +1847,9 @@ class MainWindow(QMainWindow):
     DEFAULT_WINDOW_DOCK_STATE_KEY = "default_main_window_dock_state_v1"
     OPEN_TUNE_PLACEHOLDER_KEY = "__open_tune_file__"
     ROW_VIZ_SERIES_BY_TABLE_TYPE: dict[str, list[str]] = {
-        "ve": ["table", "raw", "corrected", "average"],
-        "afr": ["table", "afr", "afr_target", "afr_error"],
-        "knock": ["table", "knock"],
+        "ve": ["table", "average"],
+        "afr": ["table"],
+        "knock": ["table"],
         "generic": ["table"],
     }
 
@@ -1192,6 +1878,7 @@ class MainWindow(QMainWindow):
         self._active_row_edit_snapshot: list[float] | None = None
         self.global_undo_stack: list[dict[str, Any]] = []
         self.global_redo_stack: list[dict[str, Any]] = []
+        self._active_global_cell_edit: dict[str, Any] | None = None
         self._history_is_applying = False
         self.undo_action: QAction | None = None
         self.redo_action: QAction | None = None
@@ -1214,11 +1901,13 @@ class MainWindow(QMainWindow):
         self.show_2d_tables = True
         self.show_tunerstudio_names = True
         self.row_viz_preferences: dict[str, dict[str, bool]] = self._default_row_viz_preferences()
+        self.table_log_channel_preferences: dict[str, dict[str, dict[str, bool]]] = {}
 
         self._load_recent_files()
         self._load_favorites()
         self._load_table_filter_preferences()
         self._load_row_viz_preferences()
+        self._load_table_log_channel_preferences()
         self._load_working_folder()
 
         self._create_menu()
@@ -1323,6 +2012,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_dock_layout()
+        try:
+            self._save_row_viz_preferences()
+            self._save_table_log_channel_preferences()
+        except Exception:
+            # Do not block app shutdown on preference write failures.
+            pass
         super().closeEvent(event)
 
     def _restore_dock_layout(self) -> None:
@@ -1434,13 +2129,43 @@ class MainWindow(QMainWindow):
 
     def _refresh_history_action_state(self) -> None:
         if self.undo_action is not None:
-            self.undo_action.setEnabled(bool(self.global_undo_stack))
+            self.undo_action.setEnabled(bool(self.global_undo_stack) or self._active_global_cell_edit is not None)
         if self.redo_action is not None:
             self.redo_action.setEnabled(bool(self.global_redo_stack))
 
     def _clear_global_history(self) -> None:
         self.global_undo_stack.clear()
         self.global_redo_stack.clear()
+        self._active_global_cell_edit = None
+        self._refresh_history_action_state()
+
+    def _flush_active_global_cell_edit(self) -> None:
+        pending = self._active_global_cell_edit
+        if pending is None:
+            return
+        self._active_global_cell_edit = None
+
+        if self._history_is_applying:
+            self._refresh_history_action_state()
+            return
+
+        old_value = float(pending.get("old", 0.0))
+        new_value = float(pending.get("new", 0.0))
+        if abs(new_value - old_value) <= 1e-9:
+            self._refresh_history_action_state()
+            return
+
+        self.global_undo_stack.append(
+            {
+                "table": str(pending.get("table", "")),
+                "row": int(pending.get("row", -1)),
+                "col": int(pending.get("col", -1)),
+                "old": old_value,
+                "new": new_value,
+            }
+        )
+        if len(self.global_undo_stack) > 5000:
+            self.global_undo_stack = self.global_undo_stack[-5000:]
         self._refresh_history_action_state()
 
     def _current_editor_cell_coordinates(self, column_index: int) -> tuple[int, int] | None:
@@ -1478,17 +2203,37 @@ class MainWindow(QMainWindow):
         if abs(float(new_value) - float(old_value)) <= 1e-9:
             return
 
-        self.global_undo_stack.append(
-            {
+        edit_key = (table_name, int(row_index), int(column_index))
+        pending = self._active_global_cell_edit
+        pending_key = None
+        if pending is not None:
+            pending_key = (
+                str(pending.get("table", "")),
+                int(pending.get("row", -1)),
+                int(pending.get("col", -1)),
+            )
+
+        if pending is None:
+            self._active_global_cell_edit = {
                 "table": table_name,
                 "row": int(row_index),
                 "col": int(column_index),
                 "old": float(old_value),
                 "new": float(new_value),
             }
-        )
-        if len(self.global_undo_stack) > 5000:
-            self.global_undo_stack = self.global_undo_stack[-5000:]
+        elif pending_key == edit_key:
+            pending["new"] = float(new_value)
+        else:
+            self._flush_active_global_cell_edit()
+            self._active_global_cell_edit = {
+                "table": table_name,
+                "row": int(row_index),
+                "col": int(column_index),
+                "old": float(old_value),
+                "new": float(new_value),
+            }
+
+        # A new edit invalidates redo history immediately.
         self.global_redo_stack.clear()
         self._refresh_history_action_state()
 
@@ -1602,6 +2347,7 @@ class MainWindow(QMainWindow):
             self._history_is_applying = False
 
     def _trigger_global_undo(self) -> None:
+        self._flush_active_global_cell_edit()
         if not self.global_undo_stack:
             return
         entry = self.global_undo_stack.pop()
@@ -1611,6 +2357,7 @@ class MainWindow(QMainWindow):
         self._refresh_history_action_state()
 
     def _trigger_global_redo(self) -> None:
+        self._flush_active_global_cell_edit()
         if not self.global_redo_stack:
             return
         entry = self.global_redo_stack.pop()
@@ -1654,6 +2401,8 @@ class MainWindow(QMainWindow):
         previous_row: int,
         previous_column: int,
     ) -> None:
+        if current_column != previous_column:
+            self._flush_active_global_cell_edit()
         _ = (current_row, current_column, previous_row, previous_column)
         self._apply_row_editor_selection_highlight()
         self._sync_editor_selection_to_row_plot()
@@ -1853,19 +2602,13 @@ class MainWindow(QMainWindow):
         return {
             "ve": {
                 "table": True,
-                "raw": True,
-                "corrected": True,
                 "average": True,
             },
             "afr": {
                 "table": True,
-                "afr": True,
-                "afr_target": True,
-                "afr_error": True,
             },
             "knock": {
                 "table": True,
-                "knock": True,
             },
             "generic": {
                 "table": True,
@@ -1891,6 +2634,223 @@ class MainWindow(QMainWindow):
     def _save_row_viz_preferences(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("row_viz_preferences", self.row_viz_preferences)
+
+    def _table_log_preferences_path(self) -> Path:
+        return Path.home() / ".gyatt_o_tune" / "current_preferences.json"
+
+    @staticmethod
+    def _normalize_table_log_channel_preferences(
+        raw: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized: dict[str, Any] = {}
+        for table_name, channels in raw.items():
+            if table_name == "__custom_identifiers__":
+                if isinstance(channels, dict):
+                    normalized[table_name] = {}
+                    for identifier_name, cfg in channels.items():
+                        if not isinstance(identifier_name, str) or not identifier_name.strip() or not isinstance(cfg, dict):
+                            continue
+                        expression = str(cfg.get("expression", "")).strip()
+                        if not expression:
+                            continue
+                        normalized[table_name][identifier_name.strip()] = {
+                            "expression": expression,
+                            "units": str(cfg.get("units", "")).strip(),
+                        }
+                continue
+            if table_name == "__point_cloud__":
+                if isinstance(channels, dict):
+                    normalized[table_name] = {}
+                    for source_name, targets in channels.items():
+                        if not isinstance(targets, dict):
+                            continue
+                        normalized[table_name][source_name] = {
+                            target_name: bool(enabled) for target_name, enabled in targets.items()
+                        }
+                continue
+            if not isinstance(channels, dict):
+                continue
+            normalized[table_name] = {}
+            for channel_name, prefs in channels.items():
+                if not isinstance(prefs, dict):
+                    continue
+                normalized[table_name][channel_name] = {
+                    "show_in_scatterplot": bool(prefs.get("show_in_scatterplot", False)),
+                    "show_when_point_selected": bool(prefs.get("show_when_point_selected", False)),
+                    "scatter_color": str(prefs.get("scatter_color", "")),
+                    "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                }
+        return normalized
+
+    def _load_table_log_channel_preferences(self) -> None:
+        path = self._table_log_preferences_path()
+        if not path.exists():
+            self.table_log_channel_preferences = {}
+            return
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            tables = payload.get("tables", payload)
+            if not isinstance(tables, dict):
+                self.table_log_channel_preferences = {}
+                return
+            self.table_log_channel_preferences = self._normalize_table_log_channel_preferences(tables)
+        except Exception:
+            self.table_log_channel_preferences = {}
+
+    def _save_table_log_channel_preferences(self) -> None:
+        path = self._table_log_preferences_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "tables": self._normalize_table_log_channel_preferences(self.table_log_channel_preferences),
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _point_cloud_detail_channels(self, source_channel_name: str) -> list[str]:
+        point_cloud = self.table_log_channel_preferences.get("__point_cloud__", {})
+        if not isinstance(point_cloud, dict):
+            return []
+        targets = point_cloud.get(source_channel_name, {})
+        if not isinstance(targets, dict):
+            return []
+        return [name for name, enabled in targets.items() if bool(enabled)]
+
+    def _custom_identifier_definitions(self) -> dict[str, dict[str, str]]:
+        raw = self.table_log_channel_preferences.get("__custom_identifiers__", {})
+        if not isinstance(raw, dict):
+            return {}
+        cleaned: dict[str, dict[str, str]] = {}
+        for identifier_name, cfg in raw.items():
+            if not isinstance(identifier_name, str) or not isinstance(cfg, dict):
+                continue
+            expression = str(cfg.get("expression", "")).strip()
+            if not expression:
+                continue
+            cleaned[identifier_name] = {
+                "expression": expression,
+                "units": str(cfg.get("units", "")).strip(),
+            }
+        return cleaned
+
+    def _all_identifier_names_for_preferences(self) -> list[str]:
+        base = [str(col) for col in self.log_df.columns] if self.log_df is not None else []
+        merged = list(base)
+        for custom_name in self._custom_identifier_definitions().keys():
+            if custom_name not in merged:
+                merged.append(custom_name)
+        return merged
+
+    @staticmethod
+    def _tokenize_identifier_expression(expression: str, candidate_names: list[str]) -> tuple[str, dict[str, str], str | None]:
+        transformed = str(expression)
+        token_map: dict[str, str] = {}
+        ordered_names = sorted([name for name in candidate_names if isinstance(name, str) and name], key=len, reverse=True)
+        for idx, name in enumerate(ordered_names):
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+            token = f"__id{idx}__"
+            if pattern.search(transformed):
+                transformed = pattern.sub(token, transformed)
+                token_map[token] = name
+
+        scrubbed = transformed
+        for token in token_map.keys():
+            scrubbed = scrubbed.replace(token, "")
+        scrubbed = re.sub(r"[0-9eE+\-*/().\s]", "", scrubbed)
+        if scrubbed:
+            return transformed, token_map, f"Unknown identifier content: '{scrubbed}'"
+        return transformed, token_map, None
+
+    def _resolve_identifier_series(
+        self,
+        identifier_name: str,
+        custom_defs: dict[str, dict[str, str]],
+        cache: dict[str, Any],
+        stack: set[str],
+    ) -> Any:
+        if identifier_name in cache:
+            return cache[identifier_name]
+        if self.log_df is not None and identifier_name in self.log_df.columns:
+            numeric = self._to_numeric_series(self.log_df[identifier_name])
+            if numeric is not None:
+                cache[identifier_name] = numeric
+            return numeric
+        if identifier_name in stack:
+            return None
+        cfg = custom_defs.get(identifier_name)
+        if not isinstance(cfg, dict):
+            return None
+
+        expression = str(cfg.get("expression", "")).strip()
+        if not expression:
+            return None
+
+        candidates = []
+        if self.log_df is not None:
+            candidates.extend([str(col) for col in self.log_df.columns])
+        candidates.extend(list(custom_defs.keys()))
+        transformed, token_map, error = self._tokenize_identifier_expression(expression, candidates)
+        if error is not None:
+            return None
+        if len(set(token_map.values())) == 0 or len(set(token_map.values())) > 5:
+            return None
+
+        env: dict[str, Any] = {}
+        next_stack = set(stack)
+        next_stack.add(identifier_name)
+        for token, source_name in token_map.items():
+            source_series = self._resolve_identifier_series(source_name, custom_defs, cache, next_stack)
+            if source_series is None:
+                return None
+            env[token] = source_series
+
+        try:
+            parsed = ast.parse(transformed, mode="eval")
+        except Exception:
+            return None
+
+        def _eval(node: ast.AST) -> Any:
+            if isinstance(node, ast.Expression):
+                return _eval(node.body)
+            if isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Div):
+                    return left / right
+                raise ValueError("Unsupported operator")
+            if isinstance(node, ast.UnaryOp):
+                value = _eval(node.operand)
+                if isinstance(node.op, ast.UAdd):
+                    return value
+                if isinstance(node.op, ast.USub):
+                    return -value
+                raise ValueError("Unsupported unary operator")
+            if isinstance(node, ast.Name):
+                if node.id not in env:
+                    raise ValueError("Unknown token")
+                return env[node.id]
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError("Unsupported expression")
+
+        try:
+            import pandas as pd
+
+            evaluated = _eval(parsed)
+            if hasattr(evaluated, "shape"):
+                numeric_eval = pd.to_numeric(evaluated, errors="coerce")
+            else:
+                numeric_eval = pd.Series([float(evaluated)] * len(self.log_df), index=self.log_df.index)
+            cache[identifier_name] = numeric_eval
+            return numeric_eval
+        except Exception:
+            return None
 
     def _on_row_viz_visibility_changed(self, visibility: dict[str, bool]) -> None:
         table_type = self._row_table_type()
@@ -1998,130 +2958,28 @@ class MainWindow(QMainWindow):
 
         y_label = units if units else "Value"
 
-        if self.log_df is not None and not self.log_df.empty and "knock" in table_name.lower():
+        if self.log_df is not None and not self.log_df.empty:
             rpm_channel = None
-            knock_channel = None
-            afr_channel = None
-            afr_target_channel = None
-            afr_error_channel = None
-            time_elapsed_channel = None
-            cranking_channel = None
-            warmup_enrichment_channel = None
-            startup_enrichment_channel = None
-            ignition_advance_channel = None
             for col in self.log_df.columns:
                 col_lower = str(col).lower()
                 if rpm_channel is None and ('rpm' in col_lower or 'engine speed' in col_lower):
                     rpm_channel = str(col)
-                if knock_channel is None and ('knock in' in col_lower or 'knock_in' in col_lower or 'knockin' in col_lower):
-                    knock_channel = str(col)
-                if (
-                    not afr_channel
-                    and ('afr' in col_lower or 'lambda' in col_lower)
-                    and 'target' not in col_lower
-                    and 'tgt' not in col_lower
-                    and 'error' not in col_lower
-                    and 'err' not in col_lower
-                ):
-                    afr_channel = str(col)
-                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
-                    afr_target_channel = str(col)
-                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
-                    afr_error_channel = str(col)
-                if not time_elapsed_channel and (
-                    ('time' in col_lower and ('sec' in col_lower or 'elapsed' in col_lower))
-                    or col_lower in {'time', 'seconds', 'sec'}
-                ):
-                    time_elapsed_channel = str(col)
-                if not cranking_channel and 'crank' in col_lower:
-                    cranking_channel = str(col)
-                if not warmup_enrichment_channel and (
-                    'warmup' in col_lower
-                    or 'warm up' in col_lower
-                    or 'wue' in col_lower
-                ):
-                    warmup_enrichment_channel = str(col)
-                if not startup_enrichment_channel and (
-                    'startup' in col_lower
-                    or 'start up' in col_lower
-                    or 'afterstart' in col_lower
-                    or 'ase' in col_lower
-                ):
-                    startup_enrichment_channel = str(col)
-                if (
-                    not ignition_advance_channel
-                    and ('advance' in col_lower or ('ign' in col_lower and 'adv' in col_lower) or ('spark' in col_lower and 'adv' in col_lower))
-                    and 'table' not in col_lower
-                ):
-                    ignition_advance_channel = str(col)
-            if knock_channel is None:
-                for col in self.log_df.columns:
-                    col_lower = str(col).lower()
-                    if 'knock' in col_lower and 'threshold' not in col_lower:
-                        knock_channel = str(col)
-                        break
 
-            if rpm_channel and knock_channel:
+            if rpm_channel is not None:
                 rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
-                knock_series = self._to_numeric_series(self.log_df[knock_channel])
-                afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
-                afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
-                afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
-                time_elapsed_series = self._to_numeric_series(self.log_df[time_elapsed_channel]) if time_elapsed_channel else None
-                cranking_series = self._to_numeric_series(self.log_df[cranking_channel]) if cranking_channel else None
-                warmup_enrichment_series = self._to_numeric_series(self.log_df[warmup_enrichment_channel]) if warmup_enrichment_channel else None
-                startup_enrichment_series = self._to_numeric_series(self.log_df[startup_enrichment_channel]) if startup_enrichment_channel else None
-                ignition_advance_series = self._to_numeric_series(self.log_df[ignition_advance_channel]) if ignition_advance_channel else None
-                if rpm_series is not None and knock_series is not None:
-                    import numpy as np
-
-                    rpm_vals = np.asarray(rpm_series, dtype=float)
-                    knock_vals = np.asarray(knock_series, dtype=float)
-                    finite = np.isfinite(rpm_vals) & np.isfinite(knock_vals)
-                    rpm_vals = rpm_vals[finite]
-                    knock_vals = knock_vals[finite]
-
-                    def to_optional_values(series: Any) -> list[float | None]:
-                        if series is None:
-                            return [None] * len(rpm_vals)
-                        values = np.asarray(series, dtype=float)[finite]
-                        return [float(v) if np.isfinite(v) else None for v in values]
-
-                    afr_vals = to_optional_values(afr_series)
-                    afr_target_vals = to_optional_values(afr_target_series)
-                    afr_error_vals = to_optional_values(afr_error_series)
-                    if afr_error_series is None and afr_series is not None and afr_target_series is not None:
-                        afr_error_vals = [
-                            (float(a) - float(t)) if (a is not None and t is not None) else None
-                            for a, t in zip(afr_vals, afr_target_vals)
-                        ]
-                    time_elapsed_vals = to_optional_values(time_elapsed_series)
-                    cranking_vals = to_optional_values(cranking_series)
-                    warmup_vals = to_optional_values(warmup_enrichment_series)
-                    startup_vals = to_optional_values(startup_enrichment_series)
-                    ignition_advance_vals = to_optional_values(ignition_advance_series)
-
-                    if len(rpm_vals) > 0:
-                        point_sets.append(
-                            {
-                                "series_id": "knock",
-                                "name": "Knock In",
-                                "rpm": [float(v) for v in rpm_vals],
-                                "ve": [float(v) for v in knock_vals],
-                                "map": [0.0] * len(rpm_vals),
-                                "ve_raw": [float(v) for v in knock_vals],
-                                "ve_scaled": [float(v) for v in knock_vals],
-                                "afr": afr_vals,
-                                "afr_target": afr_target_vals,
-                                "afr_error": afr_error_vals,
-                                "time_elapsed": time_elapsed_vals,
-                                "cranking_status": cranking_vals,
-                                "warmup_enrichment": warmup_vals,
-                                "startup_enrichment": startup_vals,
-                                "ignition_advance": ignition_advance_vals,
-                            }
-                        )
-                        stats += f"\nKnock points: {len(rpm_vals)}"
+                if rpm_series is not None:
+                    map_mask = rpm_series == rpm_series
+                    filtered_rpm_values = [float(v) for v in rpm_series[map_mask]]
+                    filtered_map_values = [0.0] * len(filtered_rpm_values)
+                    self._apply_table_log_channel_preferences_to_payload(
+                        table_name=table_name,
+                        point_sets=point_sets,
+                        table_rpm_values=[float(v) for v in x_values],
+                        map_mask=map_mask,
+                        filtered_rpm_values=filtered_rpm_values,
+                        filtered_map_values=filtered_map_values,
+                    )
+                    stats += f"\nLog points: {len(filtered_rpm_values)}"
 
         return {
             "title": title,
@@ -2310,18 +3168,6 @@ class MainWindow(QMainWindow):
         self._maybe_prompt_load_matching_log(file_path)
         return True
 
-    def _show_startup_tune_dialog(self) -> None:
-        dialog = StartupTuneDialog(self.recent_tune_files, self.windowIcon(), self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        selected_path = dialog.selected_tune_path
-        if selected_path is None:
-            return
-
-        if self._open_recent_tune_file(selected_path):
-            self._load_default_window_layout()
-
     def _open_recent_log_file(self, file_path: Path) -> None:
         if not file_path.exists():
             QMessageBox.warning(self, "File Not Found", f"The file {file_path} no longer exists.")
@@ -2466,17 +3312,50 @@ class MainWindow(QMainWindow):
         self._update_table_display()
 
     def _open_preferences(self) -> None:
-        dialog = RowVisualizationPreferencesDialog(
-            table_type_series=self.ROW_VIZ_SERIES_BY_TABLE_TYPE,
-            current_preferences=self.row_viz_preferences,
+        if self.tune_data is None or not self.tune_data.tables:
+            QMessageBox.information(self, "Preferences", "Load a tune file first to configure per-table preferences.")
+            return
+
+        if self.log_df is None or self.log_df.empty:
+            QMessageBox.information(self, "Preferences", "Load a log file first to configure logged channel preferences.")
+            return
+
+        # Always start the dialog from the canonical current preferences file.
+        self._load_table_log_channel_preferences()
+
+        table_names = sorted(self.tune_data.tables.keys())
+        table_display_names = {
+            table_name: (self._get_tunerstudio_name(table_name) if self.show_tunerstudio_names else table_name)
+            for table_name in table_names
+        }
+        table_dimensions = {
+            table_name: (table.rows == 1 or table.cols == 1)
+            for table_name, table in self.tune_data.tables.items()
+        }
+        log_channel_names = self._all_identifier_names_for_preferences()
+        initial_table_name = self.current_table.name if self.current_table is not None else "veTable1"
+        dialog = TableLogChannelPreferencesDialog(
+            table_names=table_names,
+            table_dimensions=table_dimensions,
+            table_display_names=table_display_names,
+            log_channel_names=log_channel_names,
+            current_preferences=self.table_log_channel_preferences,
+            current_preferences_path=self._table_log_preferences_path(),
+            initial_table_name=initial_table_name,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("Cancelled row data preferences changes", 3000)
             return
 
-        self.row_viz_preferences = dialog.preferences()
-        self._save_row_viz_preferences()
-        self.statusBar().showMessage("Saved row visualization preferences", 3000)
+        # Apply preferences whenever the dialog is closed, except explicit Cancel.
+        self.table_log_channel_preferences = dialog.preferences()
+        try:
+            self._save_table_log_channel_preferences()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Preferences", f"Preferences updated in memory, but could not save to disk:\n{exc}")
+
+        self.statusBar().showMessage("Saved row data preferences", 3000)
         self._update_table_grid_row_visualization()
 
     def _show_table_context_menu(self, position) -> None:
@@ -2585,7 +3464,7 @@ class MainWindow(QMainWindow):
 
         self.table_grid = CopyPasteTableWidget()
         self.table_grid.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table_grid.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self.table_grid.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table_grid.itemSelectionChanged.connect(self._on_table_grid_row_selection_changed)
         self.table_grid.cellClicked.connect(self._on_table_grid_cell_clicked)
         self.table_grid.currentCellChanged.connect(self._on_table_grid_current_cell_changed)
@@ -2725,14 +3604,16 @@ class MainWindow(QMainWindow):
         self,
         map_value: float,
         rpm_values: list[float],
-        table_ve_values: list[float],
+        table_row_values: list[float],
     ) -> dict[str, Any]:
         rpm_point_values = [float(v) for v in rpm_values]
-        table_point_values = [float(v) for v in table_ve_values]
+        table_point_values = [float(v) for v in table_row_values]
+        table_name = self.current_table.name if self.current_table is not None else "Table"
+        y_label = self.current_table.units if self.current_table is not None and self.current_table.units else "Value"
         point_sets: list[dict[str, Any]] = [
             {
                 "series_id": "table",
-                "name": "Table VE",
+                "name": "Selected Row Data",
                 "rpm": rpm_point_values,
                 "ve": table_point_values,
                 "map": [float(map_value)] * len(rpm_point_values),
@@ -2745,22 +3626,22 @@ class MainWindow(QMainWindow):
             }
         ]
 
-        title = f"MAP {map_value} kPa - Table VE"
-        stats = f"Table VE values for MAP {map_value} kPa\n"
+        title = f"MAP {map_value} kPa - Selected Row"
+        stats = f"Selected row values for MAP {map_value} kPa\n"
         stats += f"RPM range: {min(rpm_values):.0f} - {max(rpm_values):.0f}\n"
-        stats += f"VE range: {min(table_ve_values):.1f}% - {max(table_ve_values):.1f}%"
+        stats += f"Value range: {min(table_row_values):.3f} - {max(table_row_values):.3f}"
 
         if self.log_df is None or self.log_df.empty:
-            return {"title": title, "stats": stats + "\n\nNo log data loaded.", "point_sets": point_sets}
+            return {
+                "title": title,
+                "stats": stats + "\n\nNo log data loaded.",
+                "point_sets": point_sets,
+                "y_label": y_label,
+            }
 
         try:
             rpm_channel = None
             map_channel = None
-            ve1_channel = None
-            ego_cor1_channel = None
-            afr_channel = None
-            afr_target_channel = None
-            afr_error_channel = None
 
             for col in self.log_df.columns:
                 col_lower = str(col).lower()
@@ -2768,50 +3649,25 @@ class MainWindow(QMainWindow):
                     rpm_channel = str(col)
                 if not map_channel and ('map' in col_lower):
                     map_channel = str(col)
-                if not ve1_channel and ('ve1' in col_lower or 've 1' in col_lower):
-                    ve1_channel = str(col)
-                if not ego_cor1_channel and ('ego' in col_lower and 'cor1' in col_lower):
-                    ego_cor1_channel = str(col)
-                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
-                    afr_target_channel = str(col)
-                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
-                    afr_error_channel = str(col)
-                if (
-                    not afr_channel
-                    and ('afr' in col_lower or 'lambda' in col_lower)
-                    and 'target' not in col_lower
-                    and 'tgt' not in col_lower
-                    and 'error' not in col_lower
-                    and 'err' not in col_lower
-                ):
-                    afr_channel = str(col)
 
-            if not rpm_channel or not map_channel or not ve1_channel:
+            if not rpm_channel or not map_channel:
                 return {
                     "title": f"MAP {map_value} kPa - Required channels not found",
-                    "stats": stats + "\n\nRequired channels not found in log data.\nNeed: RPM, MAP, VE1",
+                    "stats": stats + "\n\nRequired channels not found in log data.\nNeed: RPM and MAP",
                     "point_sets": point_sets,
+                    "y_label": y_label,
                 }
 
             rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
             map_series = self._to_numeric_series(self.log_df[map_channel])
-            ve_series = self._to_numeric_series(self.log_df[ve1_channel])
-            afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
-            afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
-            afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
 
-            if rpm_series is None or map_series is None or ve_series is None:
+            if rpm_series is None or map_series is None:
                 return {
                     "title": f"MAP {map_value} kPa - Could not convert data",
                     "stats": stats + "\n\nCould not convert log data to numeric values.",
                     "point_sets": point_sets,
+                    "y_label": y_label,
                 }
-
-            ve_corrected_series = ve_series.copy()
-            if ego_cor1_channel is not None:
-                ego_series = self._to_numeric_series(self.log_df[ego_cor1_channel])
-                if ego_series is not None:
-                    ve_corrected_series = ve_series * (ego_series / 100.0)
 
             map_tolerance = 10.0
             if self.current_y_axis is not None and len(self.current_y_axis.values) > 1:
@@ -2821,119 +3677,39 @@ class MainWindow(QMainWindow):
             map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
             filtered_rpm = rpm_series[map_mask]
             filtered_map = map_series[map_mask]
-            filtered_ve_raw = ve_series[map_mask]
-            filtered_ve_corrected = ve_corrected_series[map_mask]
-            filtered_afr = afr_series[map_mask] if afr_series is not None else None
-            filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
-            filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
 
             if len(filtered_rpm) == 0 and map_tolerance < 20.0:
                 map_tolerance = 20.0
                 map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
                 filtered_rpm = rpm_series[map_mask]
                 filtered_map = map_series[map_mask]
-                filtered_ve_raw = ve_series[map_mask]
-                filtered_ve_corrected = ve_corrected_series[map_mask]
-                filtered_afr = afr_series[map_mask] if afr_series is not None else None
-                filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
-                filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
-
-            if filtered_afr_error is None and filtered_afr is not None and filtered_afr_target is not None:
-                filtered_afr_error = filtered_afr - filtered_afr_target
 
             if len(filtered_rpm) == 0:
                 return {
                     "title": f"MAP {map_value} kPa - No data near MAP value",
                     "stats": stats + f"\n\nNo log data found near MAP {map_value} kPa (±{map_tolerance} kPa).",
                     "point_sets": point_sets,
+                    "y_label": y_label,
                 }
 
             filtered_rpm_values = [float(v) for v in filtered_rpm]
             filtered_map_values = [float(v) for v in filtered_map]
-            filtered_ve_raw_values = [float(v) for v in filtered_ve_raw]
-            filtered_ve_corrected_values = [float(v) for v in filtered_ve_corrected]
-            filtered_afr_values = [float(v) for v in filtered_afr] if filtered_afr is not None else [None] * len(filtered_rpm_values)
-            filtered_afr_target_values = [float(v) for v in filtered_afr_target] if filtered_afr_target is not None else [None] * len(filtered_rpm_values)
-            filtered_afr_error_values = [float(v) for v in filtered_afr_error] if filtered_afr_error is not None else [None] * len(filtered_rpm_values)
-
-            table_afr_values: list[float | None] = []
-            table_afr_target_values: list[float | None] = []
-            table_afr_error_values: list[float | None] = []
-            table_afr_predicted_values: list[float | None] = []
-            for rpm_value in rpm_point_values:
-                nearest_index = min(range(len(filtered_rpm_values)), key=lambda idx: abs(filtered_rpm_values[idx] - rpm_value))
-                table_afr_values.append(filtered_afr_values[nearest_index])
-                table_afr_target_values.append(filtered_afr_target_values[nearest_index])
-                table_afr_error_values.append(filtered_afr_error_values[nearest_index])
-
-            for rpm_value, table_ve_value in zip(rpm_point_values, table_point_values):
-                predicted = self._predict_afr_from_neighbors(
-                    target_rpm=float(rpm_value),
-                    target_map=float(map_value),
-                    target_ve=float(table_ve_value),
-                    rpm_values=filtered_rpm_values,
-                    map_values=filtered_map_values,
-                    ve_corrected_values=filtered_ve_corrected_values,
-                    afr_values=filtered_afr_values,
-                )
-                table_afr_predicted_values.append(predicted)
-
-            point_sets[0]["afr"] = table_afr_values
-            point_sets[0]["afr_predicted"] = table_afr_predicted_values
-            point_sets[0]["afr_target"] = table_afr_target_values
-            point_sets[0]["afr_error"] = table_afr_error_values
-
-            point_sets.append(
-                {
-                    "series_id": "raw",
-                    "name": "Raw VE1",
-                    "rpm": filtered_rpm_values,
-                    "ve": filtered_ve_raw_values,
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_ve_raw_values,
-                    "ve_scaled": filtered_ve_raw_values,
-                    "afr": filtered_afr_values,
-                    "afr_predicted": [None] * len(filtered_rpm_values),
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                }
+            self._apply_table_log_channel_preferences_to_payload(
+                table_name=table_name,
+                point_sets=point_sets,
+                table_rpm_values=rpm_point_values,
+                map_mask=map_mask,
+                filtered_rpm_values=filtered_rpm_values,
+                filtered_map_values=filtered_map_values,
             )
-            point_sets.append(
-                {
-                    "series_id": "corrected",
-                    "name": "EGO Corrected VE",
-                    "rpm": filtered_rpm_values,
-                    "ve": filtered_ve_corrected_values,
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_ve_raw_values,
-                    "ve_scaled": filtered_ve_corrected_values,
-                    "afr": filtered_afr_values,
-                    "afr_predicted": [None] * len(filtered_rpm_values),
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                }
-            )
-
-            raw_mean = filtered_ve_raw.mean()
-            raw_std = filtered_ve_raw.std()
-            corrected_mean = filtered_ve_corrected.mean()
-            corrected_std = filtered_ve_corrected.std()
-
             stats += f"\n\nLogged Data ({len(filtered_rpm)} points):\n"
-            stats += f"Raw VE1: {raw_mean:.1f}% (σ={raw_std:.1f})\n"
-            stats += f"EGO Corrected: {corrected_mean:.1f}% (σ={corrected_std:.1f})\n"
-            predicted_only = [v for v in table_afr_predicted_values if v is not None]
-            target_only = [v for v in table_afr_target_values if v is not None]
-            if predicted_only:
-                stats += f"Predicted AFR (row avg): {sum(predicted_only) / len(predicted_only):.2f}\n"
-            if target_only:
-                stats += f"AFR target (row avg): {sum(target_only) / len(target_only):.2f}\n"
             stats += f"RPM range: {filtered_rpm.min():.0f} - {filtered_rpm.max():.0f}"
 
             return {
                 "title": f"MAP {map_value} kPa - {len(filtered_rpm)} points",
                 "stats": stats,
                 "point_sets": point_sets,
+                "y_label": y_label,
             }
 
         except Exception as exc:
@@ -2941,465 +3717,121 @@ class MainWindow(QMainWindow):
                 "title": f"MAP {map_value} kPa - Error: {exc}",
                 "stats": stats + f"\n\nError plotting logged data: {exc}",
                 "point_sets": point_sets,
+                "y_label": y_label,
             }
 
-    def _build_afr_row_visualization_payload(
+    def _apply_table_log_channel_preferences_to_payload(
         self,
-        map_value: float,
-        rpm_values: list[float],
-        table_afr_target_values: list[float],
-    ) -> dict[str, Any]:
-        rpm_point_values = [float(v) for v in rpm_values]
-        table_point_values = [float(v) for v in table_afr_target_values]
-        point_sets: list[dict[str, Any]] = [
-            {
-                "series_id": "table",
-                "name": "Selected Row Data",
-                "rpm": rpm_point_values,
-                "ve": table_point_values,
-                "map": [float(map_value)] * len(rpm_point_values),
-                "ve_raw": table_point_values,
-                "ve_scaled": table_point_values,
-                "afr": [None] * len(rpm_point_values),
-                "afr_target": table_point_values,
-                "afr_error": [None] * len(rpm_point_values),
-            }
-        ]
+        table_name: str,
+        point_sets: list[dict[str, Any]],
+        table_rpm_values: list[float],
+        map_mask: Any,
+        filtered_rpm_values: list[float],
+        filtered_map_values: list[float],
+    ) -> None:
+        if self.log_df is None or self.log_df.empty or not point_sets:
+            return
 
-        title = f"MAP {map_value} kPa - AFR Target Row"
-        stats = f"AFR target row for MAP {map_value} kPa\n"
-        stats += f"RPM range: {min(rpm_values):.0f} - {max(rpm_values):.0f}\n"
-        stats += f"AFR target range: {min(table_afr_target_values):.2f} - {max(table_afr_target_values):.2f}"
+        table_prefs = self.table_log_channel_preferences.get(table_name, {})
+        if not isinstance(table_prefs, dict) or not table_prefs:
+            return
 
-        if self.log_df is None or self.log_df.empty:
-            return {
-                "title": title,
-                "stats": stats + "\n\nNo log data loaded.",
-                "point_sets": point_sets,
-                "y_label": "AFR / Error",
-            }
+        table_series = point_sets[0]
+        extra_channels = table_series.get("extra_channels", {})
+        if not isinstance(extra_channels, dict):
+            extra_channels = {}
+        custom_defs = self._custom_identifier_definitions()
+        series_cache: dict[str, Any] = {}
 
-        try:
-            rpm_channel = None
-            map_channel = None
-            afr_channel = None
-            afr_target_channel = None
-            afr_error_channel = None
+        for channel_name, prefs in table_prefs.items():
+            if not isinstance(prefs, dict):
+                continue
 
-            for col in self.log_df.columns:
-                col_lower = str(col).lower()
-                if not rpm_channel and ('rpm' in col_lower or 'engine speed' in col_lower):
-                    rpm_channel = str(col)
-                if not map_channel and ('map' in col_lower):
-                    map_channel = str(col)
-                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
-                    afr_target_channel = str(col)
-                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
-                    afr_error_channel = str(col)
-                if (
-                    not afr_channel
-                    and ('afr' in col_lower or 'lambda' in col_lower)
-                    and 'target' not in col_lower
-                    and 'tgt' not in col_lower
-                    and 'error' not in col_lower
-                    and 'err' not in col_lower
-                ):
-                    afr_channel = str(col)
+            show_scatter = bool(prefs.get("show_in_scatterplot", False))
+            show_selected = bool(prefs.get("show_when_point_selected", False))
+            if not show_scatter and not show_selected:
+                continue
 
-            if not rpm_channel or not map_channel or not afr_target_channel:
-                return {
-                    "title": f"MAP {map_value} kPa - Required channels not found",
-                    "stats": stats + "\n\nRequired channels not found in log data.\nNeed: RPM, MAP, AFR Target",
-                    "point_sets": point_sets,
-                    "y_label": "AFR / Error",
-                }
-
-            rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
-            map_series = self._to_numeric_series(self.log_df[map_channel])
-            afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
-            afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel])
-            afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
-
-            if rpm_series is None or map_series is None or afr_target_series is None:
-                return {
-                    "title": f"MAP {map_value} kPa - Could not convert data",
-                    "stats": stats + "\n\nCould not convert log data to numeric values.",
-                    "point_sets": point_sets,
-                    "y_label": "AFR / Error",
-                }
-
-            if afr_error_series is None and afr_series is not None:
-                afr_error_series = afr_series - afr_target_series
-
-            map_tolerance = 10.0
-            if self.current_y_axis is not None and len(self.current_y_axis.values) > 1:
-                sorted_bins = sorted(float(v) for v in self.current_y_axis.values)
-                min_spacing = min(abs(b - a) for a, b in zip(sorted_bins, sorted_bins[1:]))
-                map_tolerance = max(10.0, min_spacing * 0.75)
-
-            map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
-            filtered_rpm = rpm_series[map_mask]
-            filtered_map = map_series[map_mask]
-            filtered_afr = afr_series[map_mask] if afr_series is not None else None
-            filtered_afr_target = afr_target_series[map_mask]
-            filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
-
-            if len(filtered_rpm) == 0 and map_tolerance < 20.0:
-                map_tolerance = 20.0
-                map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
-                filtered_rpm = rpm_series[map_mask]
-                filtered_map = map_series[map_mask]
-                filtered_afr = afr_series[map_mask] if afr_series is not None else None
-                filtered_afr_target = afr_target_series[map_mask]
-                filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
-
-            if len(filtered_rpm) == 0:
-                return {
-                    "title": f"MAP {map_value} kPa - No data near MAP value",
-                    "stats": stats + f"\n\nNo log data found near MAP {map_value} kPa (±{map_tolerance} kPa).",
-                    "point_sets": point_sets,
-                    "y_label": "AFR / Error",
-                }
-
-            filtered_rpm_values = [float(v) for v in filtered_rpm]
-            filtered_map_values = [float(v) for v in filtered_map]
-            filtered_afr_values = [float(v) for v in filtered_afr] if filtered_afr is not None else [None] * len(filtered_rpm_values)
-            filtered_afr_target_values = [float(v) for v in filtered_afr_target]
-            filtered_afr_error_values = [float(v) for v in filtered_afr_error] if filtered_afr_error is not None else [None] * len(filtered_rpm_values)
-
-            point_sets[0]["afr"] = filtered_afr_values[:len(point_sets[0]["afr"])]
-            point_sets[0]["afr_error"] = filtered_afr_error_values[:len(point_sets[0]["afr_error"])]
-
-            point_sets.append(
-                {
-                    "series_id": "afr",
-                    "name": "AFR",
-                    "rpm": filtered_rpm_values,
-                    "ve": [float(v) if v is not None else 0.0 for v in filtered_afr_values],
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_afr_values,
-                    "ve_scaled": filtered_afr_values,
-                    "afr": filtered_afr_values,
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                }
+            numeric_series = self._resolve_identifier_series(
+                channel_name,
+                custom_defs=custom_defs,
+                cache=series_cache,
+                stack=set(),
             )
-            point_sets.append(
-                {
-                    "series_id": "afr_target",
-                    "name": "AFR Target",
-                    "rpm": filtered_rpm_values,
-                    "ve": filtered_afr_target_values,
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_afr_target_values,
-                    "ve_scaled": filtered_afr_target_values,
-                    "afr": filtered_afr_values,
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                }
-            )
-            point_sets.append(
-                {
-                    "series_id": "afr_error",
-                    "name": "AFR Error",
-                    "rpm": filtered_rpm_values,
-                    "ve": [float(v) if v is not None else 0.0 for v in filtered_afr_error_values],
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_afr_error_values,
-                    "ve_scaled": filtered_afr_error_values,
-                    "afr": filtered_afr_values,
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                }
-            )
+            if numeric_series is None:
+                continue
 
-            afr_values_only = [v for v in filtered_afr_values if v is not None]
-            afr_error_only = [v for v in filtered_afr_error_values if v is not None]
+            filtered_series = numeric_series[map_mask]
+            filtered_channel_values: list[float | None] = []
+            for raw_value in filtered_series:
+                value = float(raw_value)
+                filtered_channel_values.append(value if value == value else None)
 
-            stats += f"\n\nLogged Data ({len(filtered_rpm_values)} points):\n"
-            if afr_values_only:
-                stats += f"AFR mean: {sum(afr_values_only) / len(afr_values_only):.2f}\n"
-            stats += f"AFR target mean: {sum(filtered_afr_target_values) / len(filtered_afr_target_values):.2f}\n"
-            if afr_error_only:
-                stats += f"AFR error mean: {sum(afr_error_only) / len(afr_error_only):.2f}\n"
-            stats += f"RPM range: {min(filtered_rpm_values):.0f} - {max(filtered_rpm_values):.0f}"
+            valid_points = [
+                (float(filtered_rpm_values[idx]), float(filtered_map_values[idx]), float(val))
+                for idx, val in enumerate(filtered_channel_values)
+                if idx < len(filtered_rpm_values) and idx < len(filtered_map_values) and val is not None
+            ]
 
-            return {
-                "title": f"MAP {map_value} kPa - {len(filtered_rpm_values)} points",
-                "stats": stats,
-                "point_sets": point_sets,
-                "y_label": "AFR / Error",
-            }
-        except Exception as exc:
-            return {
-                "title": f"MAP {map_value} kPa - Error: {exc}",
-                "stats": stats + f"\n\nError plotting logged data: {exc}",
-                "point_sets": point_sets,
-                "y_label": "AFR / Error",
-            }
-
-    def _build_knock_row_visualization_payload(
-        self,
-        map_value: float,
-        rpm_values: list[float],
-        table_knock_threshold_values: list[float],
-    ) -> dict[str, Any]:
-        rpm_point_values = [float(v) for v in rpm_values]
-        table_point_values = [float(v) for v in table_knock_threshold_values]
-        point_sets: list[dict[str, Any]] = [
-            {
-                "series_id": "table",
-                "name": "Knock Threshold (Selected Row)",
-                "rpm": rpm_point_values,
-                "ve": table_point_values,
-                "map": [float(map_value)] * len(rpm_point_values),
-                "ve_raw": table_point_values,
-                "ve_scaled": table_point_values,
-                "afr": [None] * len(rpm_point_values),
-                "afr_target": [None] * len(rpm_point_values),
-                "afr_error": [None] * len(rpm_point_values),
-                "time_elapsed": [None] * len(rpm_point_values),
-                "cranking_status": [None] * len(rpm_point_values),
-                "warmup_enrichment": [None] * len(rpm_point_values),
-                "startup_enrichment": [None] * len(rpm_point_values),
-                "ignition_advance": [None] * len(rpm_point_values),
-            }
-        ]
-
-        title = f"MAP {map_value} kPa - Knock Threshold Row"
-        stats = f"Knock threshold row for MAP {map_value} kPa\n"
-        stats += f"RPM range: {min(rpm_values):.0f} - {max(rpm_values):.0f}\n"
-        stats += f"Threshold range: {min(table_knock_threshold_values):.2f} - {max(table_knock_threshold_values):.2f}"
-
-        if self.log_df is None or self.log_df.empty:
-            return {
-                "title": title,
-                "stats": stats + "\n\nNo log data loaded.",
-                "point_sets": point_sets,
-                "y_label": "Knock",
-            }
-
-        try:
-            rpm_channel = None
-            map_channel = None
-            knock_channel = None
-            afr_channel = None
-            afr_target_channel = None
-            afr_error_channel = None
-            time_elapsed_channel = None
-            cranking_channel = None
-            warmup_enrichment_channel = None
-            startup_enrichment_channel = None
-            ignition_advance_channel = None
-
-            for col in self.log_df.columns:
-                col_lower = str(col).lower()
-                if not rpm_channel and ('rpm' in col_lower or 'engine speed' in col_lower):
-                    rpm_channel = str(col)
-                if not map_channel and ('map' in col_lower):
-                    map_channel = str(col)
-                if knock_channel is None and ('knock in' in col_lower or 'knock_in' in col_lower or 'knockin' in col_lower):
-                    knock_channel = str(col)
-                if (
-                    not afr_channel
-                    and ('afr' in col_lower or 'lambda' in col_lower)
-                    and 'target' not in col_lower
-                    and 'tgt' not in col_lower
-                    and 'error' not in col_lower
-                    and 'err' not in col_lower
-                ):
-                    afr_channel = str(col)
-                if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
-                    afr_target_channel = str(col)
-                if not afr_error_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('error' in col_lower or 'err' in col_lower):
-                    afr_error_channel = str(col)
-                if not time_elapsed_channel and (
-                    ('time' in col_lower and ('sec' in col_lower or 'elapsed' in col_lower))
-                    or col_lower in {'time', 'seconds', 'sec'}
-                ):
-                    time_elapsed_channel = str(col)
-                if not cranking_channel and 'crank' in col_lower:
-                    cranking_channel = str(col)
-                if not warmup_enrichment_channel and (
-                    'warmup' in col_lower
-                    or 'warm up' in col_lower
-                    or 'wue' in col_lower
-                ):
-                    warmup_enrichment_channel = str(col)
-                if not startup_enrichment_channel and (
-                    'startup' in col_lower
-                    or 'start up' in col_lower
-                    or 'afterstart' in col_lower
-                    or 'ase' in col_lower
-                ):
-                    startup_enrichment_channel = str(col)
-                if (
-                    not ignition_advance_channel
-                    and ('advance' in col_lower or ('ign' in col_lower and 'adv' in col_lower) or ('spark' in col_lower and 'adv' in col_lower))
-                    and 'table' not in col_lower
-                ):
-                    ignition_advance_channel = str(col)
-
-            if knock_channel is None:
-                for col in self.log_df.columns:
-                    col_lower = str(col).lower()
-                    if 'knock' in col_lower and 'threshold' not in col_lower:
-                        knock_channel = str(col)
-                        break
-
-            if not rpm_channel or not map_channel or not knock_channel:
-                return {
-                    "title": f"MAP {map_value} kPa - Required channels not found",
-                    "stats": stats + "\n\nRequired channels not found in log data.\nNeed: RPM, MAP, Knock In",
-                    "point_sets": point_sets,
-                    "y_label": "Knock",
-                }
-
-            rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
-            map_series = self._to_numeric_series(self.log_df[map_channel])
-            knock_series = self._to_numeric_series(self.log_df[knock_channel])
-            afr_series = self._to_numeric_series(self.log_df[afr_channel]) if afr_channel else None
-            afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
-            afr_error_series = self._to_numeric_series(self.log_df[afr_error_channel]) if afr_error_channel else None
-            time_elapsed_series = self._to_numeric_series(self.log_df[time_elapsed_channel]) if time_elapsed_channel else None
-            cranking_series = self._to_numeric_series(self.log_df[cranking_channel]) if cranking_channel else None
-            warmup_enrichment_series = self._to_numeric_series(self.log_df[warmup_enrichment_channel]) if warmup_enrichment_channel else None
-            startup_enrichment_series = self._to_numeric_series(self.log_df[startup_enrichment_channel]) if startup_enrichment_channel else None
-            ignition_advance_series = self._to_numeric_series(self.log_df[ignition_advance_channel]) if ignition_advance_channel else None
-
-            if rpm_series is None or map_series is None or knock_series is None:
-                return {
-                    "title": f"MAP {map_value} kPa - Could not convert data",
-                    "stats": stats + "\n\nCould not convert log data to numeric values.",
-                    "point_sets": point_sets,
-                    "y_label": "Knock",
-                }
-
-            map_tolerance = 10.0
-            if self.current_y_axis is not None and len(self.current_y_axis.values) > 1:
-                sorted_bins = sorted(float(v) for v in self.current_y_axis.values)
-                min_spacing = min(abs(b - a) for a, b in zip(sorted_bins, sorted_bins[1:]))
-                map_tolerance = max(10.0, min_spacing * 0.75)
-
-            map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
-            filtered_rpm = rpm_series[map_mask]
-            filtered_map = map_series[map_mask]
-            filtered_knock = knock_series[map_mask]
-            filtered_afr = afr_series[map_mask] if afr_series is not None else None
-            filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
-            filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
-            filtered_time_elapsed = time_elapsed_series[map_mask] if time_elapsed_series is not None else None
-            filtered_cranking = cranking_series[map_mask] if cranking_series is not None else None
-            filtered_warmup_enrichment = warmup_enrichment_series[map_mask] if warmup_enrichment_series is not None else None
-            filtered_startup_enrichment = startup_enrichment_series[map_mask] if startup_enrichment_series is not None else None
-            filtered_ignition_advance = ignition_advance_series[map_mask] if ignition_advance_series is not None else None
-
-            if len(filtered_rpm) == 0 and map_tolerance < 20.0:
-                map_tolerance = 20.0
-                map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
-                filtered_rpm = rpm_series[map_mask]
-                filtered_map = map_series[map_mask]
-                filtered_knock = knock_series[map_mask]
-                filtered_afr = afr_series[map_mask] if afr_series is not None else None
-                filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
-                filtered_afr_error = afr_error_series[map_mask] if afr_error_series is not None else None
-                filtered_time_elapsed = time_elapsed_series[map_mask] if time_elapsed_series is not None else None
-                filtered_cranking = cranking_series[map_mask] if cranking_series is not None else None
-                filtered_warmup_enrichment = warmup_enrichment_series[map_mask] if warmup_enrichment_series is not None else None
-                filtered_startup_enrichment = startup_enrichment_series[map_mask] if startup_enrichment_series is not None else None
-                filtered_ignition_advance = ignition_advance_series[map_mask] if ignition_advance_series is not None else None
-
-            if len(filtered_rpm) == 0:
-                return {
-                    "title": f"MAP {map_value} kPa - No data near MAP value",
-                    "stats": stats + f"\n\nNo log data found near MAP {map_value} kPa (±{map_tolerance} kPa).",
-                    "point_sets": point_sets,
-                    "y_label": "Knock",
-                }
-
-            filtered_rpm_values = [float(v) for v in filtered_rpm]
-            filtered_map_values = [float(v) for v in filtered_map]
-            filtered_knock_values = [float(v) for v in filtered_knock]
-            filtered_afr_values = [float(v) for v in filtered_afr] if filtered_afr is not None else [None] * len(filtered_rpm_values)
-            filtered_afr_target_values = [float(v) for v in filtered_afr_target] if filtered_afr_target is not None else [None] * len(filtered_rpm_values)
-            filtered_afr_error_values = [float(v) for v in filtered_afr_error] if filtered_afr_error is not None else [None] * len(filtered_rpm_values)
-            if filtered_afr_error is None and filtered_afr is not None and filtered_afr_target is not None:
-                filtered_afr_error_values = [
-                    (float(a) - float(t)) if (a is not None and t is not None) else None
-                    for a, t in zip(filtered_afr_values, filtered_afr_target_values)
+            if show_scatter and valid_points:
+                source_indices = [
+                    idx
+                    for idx, val in enumerate(filtered_channel_values)
+                    if idx < len(filtered_rpm_values) and idx < len(filtered_map_values) and val is not None
                 ]
-            filtered_time_elapsed_values = [float(v) for v in filtered_time_elapsed] if filtered_time_elapsed is not None else [None] * len(filtered_rpm_values)
-            filtered_cranking_values = [float(v) for v in filtered_cranking] if filtered_cranking is not None else [None] * len(filtered_rpm_values)
-            filtered_warmup_enrichment_values = [float(v) for v in filtered_warmup_enrichment] if filtered_warmup_enrichment is not None else [None] * len(filtered_rpm_values)
-            filtered_startup_enrichment_values = [float(v) for v in filtered_startup_enrichment] if filtered_startup_enrichment is not None else [None] * len(filtered_rpm_values)
-            filtered_ignition_advance_values = [float(v) for v in filtered_ignition_advance] if filtered_ignition_advance is not None else [None] * len(filtered_rpm_values)
+                detail_channels: dict[str, list[float | None]] = {}
+                for detail_name in self._point_cloud_detail_channels(channel_name):
+                    detail_series = self._resolve_identifier_series(
+                        detail_name,
+                        custom_defs=custom_defs,
+                        cache=series_cache,
+                        stack=set(),
+                    )
+                    if detail_series is None:
+                        continue
+                    detail_filtered = detail_series[map_mask]
+                    detail_filtered_values: list[float | None] = []
+                    for raw_value in detail_filtered:
+                        detail_value = float(raw_value)
+                        detail_filtered_values.append(detail_value if detail_value == detail_value else None)
+                    detail_values: list[float | None] = []
+                    for source_idx in source_indices:
+                        if source_idx >= len(detail_filtered_values):
+                            detail_values.append(None)
+                            continue
+                        detail_values.append(detail_filtered_values[source_idx])
+                    detail_channels[detail_name] = detail_values
 
-            table_afr_values: list[float | None] = []
-            table_afr_target_values: list[float | None] = []
-            table_afr_error_values: list[float | None] = []
-            table_time_elapsed_values: list[float | None] = []
-            table_cranking_values: list[float | None] = []
-            table_warmup_values: list[float | None] = []
-            table_startup_values: list[float | None] = []
-            table_ignition_advance_values: list[float | None] = []
-            for rpm_value in rpm_point_values:
-                nearest_index = min(range(len(filtered_rpm_values)), key=lambda idx: abs(filtered_rpm_values[idx] - rpm_value))
-                table_afr_values.append(filtered_afr_values[nearest_index])
-                table_afr_target_values.append(filtered_afr_target_values[nearest_index])
-                table_afr_error_values.append(filtered_afr_error_values[nearest_index])
-                table_time_elapsed_values.append(filtered_time_elapsed_values[nearest_index])
-                table_cranking_values.append(filtered_cranking_values[nearest_index])
-                table_warmup_values.append(filtered_warmup_enrichment_values[nearest_index])
-                table_startup_values.append(filtered_startup_enrichment_values[nearest_index])
-                table_ignition_advance_values.append(filtered_ignition_advance_values[nearest_index])
+                point_sets.append(
+                    {
+                        "series_id": f"log::{channel_name}",
+                        "name": channel_name,
+                        "rpm": [p[0] for p in valid_points],
+                        "ve": [p[2] for p in valid_points],
+                        "map": [p[1] for p in valid_points],
+                        "ve_raw": [p[2] for p in valid_points],
+                        "ve_scaled": [p[2] for p in valid_points],
+                        "detail_channels": detail_channels,
+                        "scatter_color": str(prefs.get("scatter_color", "")),
+                        "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                    }
+                )
 
-            point_sets[0]["afr"] = table_afr_values
-            point_sets[0]["afr_target"] = table_afr_target_values
-            point_sets[0]["afr_error"] = table_afr_error_values
-            point_sets[0]["time_elapsed"] = table_time_elapsed_values
-            point_sets[0]["cranking_status"] = table_cranking_values
-            point_sets[0]["warmup_enrichment"] = table_warmup_values
-            point_sets[0]["startup_enrichment"] = table_startup_values
-            point_sets[0]["ignition_advance"] = table_ignition_advance_values
+            if show_selected and valid_points:
+                valid_rpm_values = [p[0] for p in valid_points]
+                valid_channel_values = [p[2] for p in valid_points]
+                extra_channels[channel_name] = [
+                    valid_channel_values[
+                        min(
+                            range(len(valid_rpm_values)),
+                            key=lambda i: abs(float(valid_rpm_values[i]) - float(rpm_value)),
+                        )
+                    ]
+                    for rpm_value in table_rpm_values
+                ]
 
-            point_sets.append(
-                {
-                    "series_id": "knock",
-                    "name": "Knock In",
-                    "rpm": filtered_rpm_values,
-                    "ve": filtered_knock_values,
-                    "map": filtered_map_values,
-                    "ve_raw": filtered_knock_values,
-                    "ve_scaled": filtered_knock_values,
-                    "afr": filtered_afr_values,
-                    "afr_target": filtered_afr_target_values,
-                    "afr_error": filtered_afr_error_values,
-                    "time_elapsed": filtered_time_elapsed_values,
-                    "cranking_status": filtered_cranking_values,
-                    "warmup_enrichment": filtered_warmup_enrichment_values,
-                    "startup_enrichment": filtered_startup_enrichment_values,
-                    "ignition_advance": filtered_ignition_advance_values,
-                }
-            )
-
-            knock_mean = sum(filtered_knock_values) / len(filtered_knock_values)
-            stats += f"\n\nLogged Data ({len(filtered_rpm_values)} points):\n"
-            stats += f"Knock mean: {knock_mean:.3f}\n"
-            stats += f"RPM range: {min(filtered_rpm_values):.0f} - {max(filtered_rpm_values):.0f}"
-
-            return {
-                "title": f"MAP {map_value} kPa - {len(filtered_rpm_values)} points",
-                "stats": stats,
-                "point_sets": point_sets,
-                "y_label": "Knock",
-            }
-        except Exception as exc:
-            return {
-                "title": f"MAP {map_value} kPa - Error: {exc}",
-                "stats": stats + f"\n\nError plotting logged data: {exc}",
-                "point_sets": point_sets,
-                "y_label": "Knock",
-            }
+        if extra_channels:
+            table_series["extra_channels"] = extra_channels
 
     def _update_table_grid_row_controls(self) -> None:
         available, message = self._table_row_editing_available()
@@ -3755,13 +4187,7 @@ class MainWindow(QMainWindow):
         map_value = float(self.current_y_axis.values[self.selected_table_row_idx])
         cursor_x_label = self._axis_title("X", self.current_x_axis)
         cursor_y_label = self._axis_title("Y", self.current_y_axis)
-        if "knock" in table_name:
-            payload = self._build_knock_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
-        elif "afr" in table_name:
-            payload = self._build_afr_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
-        else:
-            payload = self._build_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
-            payload["y_label"] = "VE %"
+        payload = self._build_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
         
         # Add predicted VE line if it has been generated
         if self.average_line_data is not None and "ve" in table_name:
@@ -3877,14 +4303,12 @@ class MainWindow(QMainWindow):
         if self._is_current_table_1d():
             return True, ""
 
-        table_name = self.current_table.name.lower()
-        if "ve" not in table_name and "afr" not in table_name and "knock" not in table_name:
-            return False, "Row visualization is currently available for VE, AFR, and knock threshold tables."
         if self.transpose_checkbox.isChecked() or self.swap_axes_checkbox.isChecked():
             return False, "Disable Transpose Table and Swap Axes Labels to edit rows from the table grid."
         return True, ""
 
     def _clear_table_row_editor(self, status_message: str) -> None:
+        self._flush_active_global_cell_edit()
         self.selected_table_row_idx = None
         self.pending_row_values = []
         self.row_default_values = []
@@ -3953,18 +4377,14 @@ class MainWindow(QMainWindow):
             self._clear_table_row_editor("Click a row in the table grid to view and edit it.")
             return
 
-        current_column = self.table_grid.currentColumn()
-        preferred_column = current_column if current_column >= 0 else None
-        self._load_selected_table_row(source_row, preferred_column=preferred_column)
+        self._load_selected_table_row(source_row, preferred_column=None, select_editor_cell=False)
 
     def _on_table_grid_cell_clicked(self, row: int, column: int) -> None:
-        if self._is_current_table_1d():
-            self._update_table_grid_row_visualization()
-            return
         source_row = self._display_row_to_source_row(row)
         if source_row is None:
             return
-        self._load_selected_table_row(source_row, preferred_column=column)
+        editor_column = self._table_cell_to_editor_column(source_row, column)
+        self._load_selected_table_row(source_row, preferred_column=editor_column, select_editor_cell=False)
 
     def _on_table_grid_current_cell_changed(
         self,
@@ -3973,18 +4393,35 @@ class MainWindow(QMainWindow):
         previous_row: int,
         previous_column: int,
     ) -> None:
-        _ = (previous_row, previous_column)
+        _ = (current_column, previous_row, previous_column)
         if self._is_current_table_1d():
             self._update_table_grid_row_visualization()
             return
         source_row = self._display_row_to_source_row(current_row)
         if source_row is None:
             return
-        self._load_selected_table_row(source_row, preferred_column=current_column)
+        self._load_selected_table_row(source_row, preferred_column=None, select_editor_cell=False)
 
-    def _load_selected_table_row(self, source_row: int, preferred_column: int | None = None) -> None:
+    def _table_cell_to_editor_column(self, source_row: int, source_column: int) -> int | None:
+        if self.current_table is None:
+            return None
+
+        if self.current_table.rows == 1:
+            return source_column if 0 <= source_column < self.current_table.cols else None
+        if self.current_table.cols == 1:
+            return source_row if 0 <= source_row < self.current_table.rows else None
+        return source_column if 0 <= source_column < self.current_table.cols else None
+
+    def _load_selected_table_row(
+        self,
+        source_row: int,
+        preferred_column: int | None = None,
+        select_editor_cell: bool = True,
+    ) -> None:
         if self.current_table is None or self.current_x_axis is None or self.current_y_axis is None:
             return
+
+        self._flush_active_global_cell_edit()
 
         table_name = self._current_table_name()
         if table_name is None:
@@ -4005,8 +4442,10 @@ class MainWindow(QMainWindow):
             saved = self.pending_edits_per_table.get(table_name, {})
             self.average_line_data = saved.get("average_line_data")
             self.table_row_label.setText("Selected row: full 1D table")
-            self._refresh_table_row_editor(preferred_column=preferred_column)
+            self._refresh_table_row_editor(preferred_column=preferred_column, select_cell=select_editor_cell)
             self._update_table_grid_row_visualization()
+            if not select_editor_cell and preferred_column is not None:
+                self.table_row_panel.select_table_point(preferred_column, emit_callback=False)
             return
 
         self.selected_table_row_idx = source_row
@@ -4021,10 +4460,12 @@ class MainWindow(QMainWindow):
         self.average_line_data = saved.get("average_line_data")
         map_value = float(self.current_y_axis.values[source_row])
         self.table_row_label.setText(f"Selected row: MAP {map_value:g} kPa")
-        self._refresh_table_row_editor(preferred_column=preferred_column)
+        self._refresh_table_row_editor(preferred_column=preferred_column, select_cell=select_editor_cell)
         self._update_table_grid_row_visualization()
+        if not select_editor_cell and preferred_column is not None:
+            self.table_row_panel.select_table_point(preferred_column, emit_callback=False)
 
-    def _refresh_table_row_editor(self, preferred_column: int | None = None) -> None:
+    def _refresh_table_row_editor(self, preferred_column: int | None = None, select_cell: bool = True) -> None:
         self.table_row_editor.blockSignals(True)
         self.table_row_editor.clear()
         self.table_row_editor.setRowCount(1)
@@ -4039,13 +4480,15 @@ class MainWindow(QMainWindow):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item.setBackground(self._cell_color(value, minimum, span))
             self.table_row_editor.setItem(0, column_index, item)
-        if self.pending_row_values:
+        if self.pending_row_values and select_cell:
             if preferred_column is not None and 0 <= preferred_column < len(self.pending_row_values):
                 target_column = preferred_column
             else:
                 current_column = self.table_row_editor.currentColumn()
                 target_column = current_column if 0 <= current_column < len(self.pending_row_values) else 0
             self.table_row_editor.setCurrentCell(0, target_column)
+        else:
+            self.table_row_editor.clearSelection()
         self.table_row_editor.resizeColumnsToContents()
         self.table_row_editor.resizeRowsToContents()
         self.table_row_editor.setEnabled(True)
@@ -4370,6 +4813,18 @@ class MainWindow(QMainWindow):
                         seen.add(resolved)
 
         if not matching_logs:
+            prompt = QMessageBox(self)
+            prompt.setIcon(QMessageBox.Icon.Question)
+            prompt.setWindowTitle("No Matching Log Found")
+            prompt.setText(
+                f"No matching .msl/.mlg log was found for {tune_file.name}.\n\n"
+                "Would you like to browse and load a log file now?"
+            )
+            prompt.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            prompt.setDefaultButton(QMessageBox.StandardButton.Yes)
+            prompt.setEscapeButton(QMessageBox.StandardButton.No)
+            if prompt.exec() == QMessageBox.StandardButton.Yes:
+                self._open_log_file()
             return
 
         preferred_log = next((p for p in matching_logs if p.suffix.lower() == ".msl"), matching_logs[0])

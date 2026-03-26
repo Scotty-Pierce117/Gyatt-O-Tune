@@ -1,8 +1,8 @@
 from pathlib import Path
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox
 from PySide6.QtCore import Qt
 
-from gyatt_o_tune.ui.main_window import MainWindow
+from gyatt_o_tune.ui.main_window import MainWindow, TableLogChannelPreferencesDialog
 from gyatt_o_tune.core.io import TuneLoader
 
 def _get_app() -> QApplication:
@@ -73,7 +73,7 @@ def _load_first_editable_2d_table(window: MainWindow) -> tuple[str, int, int]:
     raise AssertionError("No row-editable 2D table found for undo test")
 
 
-def test_ctrl_z_reverts_cells_per_increment() -> None:
+def test_ctrl_z_reverts_cell_to_selection_start_and_redo_restores_latest() -> None:
     _get_app()
     window = MainWindow()
 
@@ -99,11 +99,14 @@ def test_ctrl_z_reverts_cells_per_increment() -> None:
     assert abs(float(window.pending_row_values[0]) - (base_col0 + 0.2)) < 1e-9
 
     window._undo_pending_row_edit()
-    assert abs(float(window.pending_row_values[0]) - (base_col0 + 0.1)) < 1e-9
-
-    window._undo_pending_row_edit()
     assert abs(float(window.pending_row_values[0]) - base_col0) < 1e-9
     assert window.selected_table_row_idx == row_index
+
+    window._redo_pending_row_edit()
+    assert abs(float(window.pending_row_values[0]) - (base_col0 + 0.2)) < 1e-9
+
+    window._redo_pending_row_edit()
+    assert abs(float(window.pending_row_values[1]) - (base_col1 + 0.1)) < 1e-9
 
     window.close()
 
@@ -174,6 +177,225 @@ def test_global_undo_navigates_to_edited_table() -> None:
     assert window.current_table.name == table_name
     assert window.selected_table_row_idx == row_index
     assert abs(float(window.pending_row_values[col_index]) - original_value) < 1e-9
+
+    window.close()
+
+
+def test_scatterplot_point_detail_preferences_do_not_remove_scatter_series() -> None:
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists(), "Test tune not found at tuning_data/SP_NB2_Rev1.msq"
+    assert log_path.exists(), "Test log not found at tuning_data/SP.msl"
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    window.current_table = window.tune_data.tables["veTable1"]
+    window.current_x_axis, window.current_y_axis = window.tune_data.resolve_table_axes(window.current_table)
+    window.selected_table_row_idx = 0
+    window.pending_row_values = [float(value) for value in window.current_table.values[0]]
+    window.table_log_channel_preferences = {
+        "veTable1": {
+            "VE1": {"show_in_scatterplot": True, "show_when_point_selected": False},
+        },
+        "__point_cloud__": {
+            "VE1": {"RPM": True, "MAP": True, "TPS": True},
+        },
+    }
+
+    payload = window._build_row_visualization_payload(
+        float(window.current_y_axis.values[0]),
+        [float(value) for value in window.current_x_axis.values],
+        window.pending_row_values,
+    )
+
+    scatter_series = [series for series in payload.get("point_sets", []) if series.get("series_id") == "log::VE1"]
+    assert scatter_series, "Expected VE1 scatter series to remain present when detail channels are configured"
+    detail_channels = scatter_series[0].get("detail_channels", {})
+    assert isinstance(detail_channels, dict)
+    assert sorted(detail_channels.keys()) == ["MAP", "RPM", "TPS"]
+    assert payload.get("title") and "Error:" not in str(payload.get("title"))
+
+    window.close()
+
+
+def test_preferences_dialog_apply_keeps_current_table_scatter_series(tmp_path) -> None:
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists(), "Test tune not found at tuning_data/SP_NB2_Rev1.msq"
+    assert log_path.exists(), "Test log not found at tuning_data/SP.msl"
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    window.current_table = window.tune_data.tables["veTable1"]
+    window.current_x_axis, window.current_y_axis = window.tune_data.resolve_table_axes(window.current_table)
+    window.selected_table_row_idx = 0
+    window.pending_row_values = [float(value) for value in window.current_table.values[0]]
+    window.table_log_channel_preferences = {
+        "veTable1": {
+            "VE1": {"show_in_scatterplot": True, "show_when_point_selected": False},
+        },
+        "__point_cloud__": {},
+    }
+
+    table_names = sorted(window.tune_data.tables.keys())
+    table_display_names = {table_name: table_name for table_name in table_names}
+    table_dimensions = {
+        table_name: (table.rows == 1 or table.cols == 1)
+        for table_name, table in window.tune_data.tables.items()
+    }
+    log_channel_names = [str(column) for column in window.log_df.columns]
+
+    dialog = TableLogChannelPreferencesDialog(
+        table_names=table_names,
+        table_dimensions=table_dimensions,
+        table_display_names=table_display_names,
+        log_channel_names=log_channel_names,
+        current_preferences=window.table_log_channel_preferences,
+        current_preferences_path=tmp_path / "current_preferences.json",
+        initial_table_name="veTable1",
+        parent=window,
+    )
+
+    source_index = dialog.point_cloud_source_combo.findText("VE1")
+    assert source_index >= 0, "Expected VE1 to be available as a Scatterplot Points source"
+    dialog.point_cloud_source_combo.setCurrentIndex(source_index)
+    for row_index in range(dialog.point_cloud_details_table.rowCount()):
+        name_item = dialog.point_cloud_details_table.item(row_index, 0)
+        check_widget = dialog.point_cloud_details_table.cellWidget(row_index, 1)
+        check_box = check_widget.property("checkbox") if check_widget is not None else None
+        if name_item is None or not isinstance(check_box, QCheckBox):
+            continue
+        check_box.setChecked(name_item.text() in {"RPM", "MAP", "TPS"})
+
+    dialog.accept()
+    window.table_log_channel_preferences = dialog.preferences()
+
+    payload = window._build_row_visualization_payload(
+        float(window.current_y_axis.values[0]),
+        [float(value) for value in window.current_x_axis.values],
+        window.pending_row_values,
+    )
+
+    scatter_series = [series for series in payload.get("point_sets", []) if series.get("series_id") == "log::VE1"]
+    assert scatter_series, "Expected VE1 scatter series to remain present after applying dialog preferences"
+    detail_channels = scatter_series[0].get("detail_channels", {})
+    assert isinstance(detail_channels, dict)
+    assert sorted(detail_channels.keys()) == ["MAP", "RPM", "TPS"]
+    assert payload.get("title") and "Error:" not in str(payload.get("title"))
+
+    window.close()
+
+
+def test_custom_identifier_series_is_computed_and_plotted() -> None:
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists(), "Test tune not found at tuning_data/SP_NB2_Rev1.msq"
+    assert log_path.exists(), "Test log not found at tuning_data/SP.msl"
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    window.current_table = window.tune_data.tables["veTable1"]
+    window.current_x_axis, window.current_y_axis = window.tune_data.resolve_table_axes(window.current_table)
+    window.selected_table_row_idx = 0
+    window.pending_row_values = [float(value) for value in window.current_table.values[0]]
+    window.table_log_channel_preferences = {
+        "veTable1": {
+            "VE1 Custom": {"show_in_scatterplot": True, "show_when_point_selected": True},
+        },
+        "__point_cloud__": {},
+        "__custom_identifiers__": {
+            "VE1 Custom": {"expression": "((VE1)/100)*VE1", "units": "%"},
+        },
+    }
+
+    payload = window._build_row_visualization_payload(
+        float(window.current_y_axis.values[0]),
+        [float(value) for value in window.current_x_axis.values],
+        window.pending_row_values,
+    )
+
+    computed_series = [series for series in payload.get("point_sets", []) if series.get("series_id") == "log::VE1 Custom"]
+    assert computed_series, "Expected computed custom identifier series to be present"
+    assert len(computed_series[0].get("rpm", [])) > 0
+    table_series = next((series for series in payload.get("point_sets", []) if series.get("series_id") == "table"), None)
+    assert isinstance(table_series, dict)
+    extra_channels = table_series.get("extra_channels", {})
+    assert isinstance(extra_channels, dict)
+    assert "VE1 Custom" in extra_channels
+
+    window.close()
+
+
+def test_selected_scatter_point_text_only_shows_configured_detail_channels() -> None:
+    _get_app()
+    window = MainWindow()
+
+    text = window.table_row_panel._format_selected_point_text(
+        {
+            "series_id": "log::VE1",
+            "name": "VE1",
+            "rpm": [1500.0],
+            "ve": [62.5],
+            "map": [48.0],
+            "detail_channels": {
+                "TPS": [12.0],
+                "CLT": [180.0],
+            },
+        },
+        0,
+    )
+
+    assert "TPS:" in text
+    assert "CLT:" in text
+    assert "VE1:" in text
+    assert text.find("VE1:") < text.find("CLT:")
+    assert text.find("VE1:") < text.find("TPS:")
+    assert "RPM:" not in text
+    assert "MAP:" not in text
+    assert "Configured data:" not in text
+
+    window.close()
+
+
+def test_selected_table_point_text_only_shows_configured_table_channels() -> None:
+    _get_app()
+    window = MainWindow()
+
+    text = window.table_row_panel._format_selected_point_text(
+        {
+            "series_id": "table",
+            "name": "Selected Row Data",
+            "rpm": [2000.0],
+            "ve": [65.0],
+            "map": [55.0],
+            "extra_channels": {
+                "EGO": [101.0],
+            },
+        },
+        0,
+    )
+
+    assert "EGO:" in text
+    assert "Selected Row Data:" in text
+    assert text.find("Selected Row Data:") < text.find("EGO:")
+    assert "RPM:" not in text
+    assert "MAP:" not in text
+    assert "Configured data:" not in text
 
     window.close()
 

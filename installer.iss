@@ -10,7 +10,7 @@
 ; or installed at the default Inno Setup location.
 
 #define AppName      "Gyatt-O-Tune"
-#define AppVersion   "0.1.2"
+#define AppVersion   "0.1.3"
 #define AppPublisher "Gyatt-O-Tune"
 #define AppURL       "https://github.com/gyatt-o-tune"
 #define AppExeName   "Gyatt-O-Tune.exe"
