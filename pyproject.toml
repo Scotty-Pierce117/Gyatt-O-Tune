@@ -1,6 +1,6 @@
 [project]
 name = "gyatt-o-tune"
-version = "0.1.3"
+version = "0.1.4"
 description = "MegaSquirt tune and log analysis desktop app"
 readme = "README.md"
 requires-python = ">=3.11"

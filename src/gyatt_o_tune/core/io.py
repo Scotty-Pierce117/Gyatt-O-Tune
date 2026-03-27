@@ -7,6 +7,94 @@ import struct
 from typing import Any
 import xml.etree.ElementTree as ET
 
+# ---------------------------------------------------------------------------
+# Explicit axis lookup for well-known MS3/MegaSquirt table names.
+# Keys are exact table names from the MSQ; values are (x_candidates, y_candidates).
+# ---------------------------------------------------------------------------
+_EXPLICIT_AXIS_MAP: dict[str, tuple[list[str], list[str]]] = {
+    # Rotary split table
+    "RotarySplitTable":              (["RotarySplitRPM"],                    ["RotarySplitLoad"]),
+    # Alpha-N MAP table
+    "alphaMAPtable":                 (["amap_rpm"],                           ["amap_tps"]),
+    # Anti-lag system
+    "als_addfuel":                   (["als_rpms"],                           ["als_tpss"]),
+    "als_fuelcut":                   (["als_rpms"],                           ["als_tpss"]),
+    "als_rifuelcut":                 (["als_rirpms"],                         ["als_ritpss"]),
+    "als_sparkcut":                  (["als_rpms"],                           ["als_tpss"]),
+    "als_timing":                    (["als_rpms"],                           ["als_tpss"]),
+    # Closed-loop boost PWM targets (numbered 1-6, Xboost variant 1-2)
+    "boost_ctl_cl_pwm_targs1":       (["Xboost_ctl_cl_pwm_rpms1",       "boost_ctl_cl_pwm_rpms"],        ["Xboost_ctl_cl_pwm_targboosts1", "boost_ctl_cl_pwm_targboosts"]),
+    "boost_ctl_cl_pwm_targs2":       (["Xboost_ctl_cl_pwm_rpms2",       "boost_ctl_cl_pwm_rpms"],        ["Xboost_ctl_cl_pwm_targboosts2", "boost_ctl_cl_pwm_targboosts"]),
+    "boost_ctl_cl_pwm_targs3":       (["boost_ctl_cl_pwm_rpms"],                                         ["boost_ctl_cl_pwm_targboosts"]),
+    "boost_ctl_cl_pwm_targs4":       (["boost_ctl_cl_pwm_rpms"],                                         ["boost_ctl_cl_pwm_targboosts"]),
+    "boost_ctl_cl_pwm_targs5":       (["boost_ctl_cl_pwm_rpms"],                                         ["boost_ctl_cl_pwm_targboosts"]),
+    "boost_ctl_cl_pwm_targs6":       (["boost_ctl_cl_pwm_rpms"],                                         ["boost_ctl_cl_pwm_targboosts"]),
+    "Xboost_ctl_cl_pwm_targs1":      (["Xboost_ctl_cl_pwm_rpms1",       "boost_ctl_cl_pwm_rpms"],        ["Xboost_ctl_cl_pwm_targboosts1", "boost_ctl_cl_pwm_targboosts"]),
+    "Xboost_ctl_cl_pwm_targs2":      (["Xboost_ctl_cl_pwm_rpms2",       "boost_ctl_cl_pwm_rpms"],        ["Xboost_ctl_cl_pwm_targboosts2", "boost_ctl_cl_pwm_targboosts"]),
+    # Boost load targets (open-loop and closed-loop)
+    "boost_ctl_load_targets":        (["boost_ctl_loadtarg_rpm_bins"],                                   ["boost_ctl_loadtarg_tps_bins"]),
+    "boost_ctl_load_targets2":       (["boost_ctl_loadtarg_rpm_bins2"],                                  ["boost_ctl_loadtarg_tps_bins2"]),
+    "boost_ctl_pwm_targets":         (["boost_ctl_pwmtarg_rpm_bins"],                                    ["boost_ctl_pwmtarg_tps_bins"]),
+    "boost_ctl_pwm_targets2":        (["boost_ctl_pwmtarg_rpm_bins2"],                                   ["boost_ctl_pwmtarg_tps_bins2"]),
+    # Boost dome pressure targets
+    "boost_dome_targets1":           (["boost_dome_target_rpms1"],                                       ["boost_dome_target_kpas1"]),
+    "boost_dome_targets2":           (["boost_dome_target_rpms2"],                                       ["boost_dome_target_kpas2"]),
+    # Dwell
+    "dwell_table_values":            (["dwell_table_rpms"],                                              ["dwell_table_loads"]),
+    # EGO authority and delay
+    "ego_auth_table":                (["ego_auth_rpms"],                                                  ["ego_auth_loads"]),
+    "ego_auth_table2":               (["ego_auth_rpms"],                                                  ["ego_auth_loads"]),
+    "ego_delay_table":               (["ego_delay_rpms"],                                                 ["ego_delay_loads"]),
+    # Electronic throttle control
+    "etc_targ_pos":                  (["etc_rpms"],                                                       ["etc_pedal_pos"]),
+    # Fuel pump duty
+    "fpd_duty":                      (["fpd_rpm"],                                                        ["fpd_load"]),
+    # Generic PID
+    "generic_pid_targets_a":         (["generic_pid_rpms_a"],                                             ["generic_pid_loadvals_a"]),
+    "generic_pid_targets_b":         (["generic_pid_rpms_b"],                                             ["generic_pid_loadvals_b"]),
+    # Idle VE tables
+    "idleve_table1":                 (["idleve_rpms1"],                                                   ["idleve_loads1"]),
+    "idleve_table2":                 (["idleve_rpms2"],                                                   ["idleve_loads2"]),
+    # Injector deadtime (X=volts, Y=fuel pressure differential)
+    "inj_deadtime_table1":           (["inj_deadtime_volts1"],                                            ["inj_deadtime_pressure1"]),
+    "inj_deadtime_table2":           (["inj_deadtime_volts2"],                                            ["inj_deadtime_pressure2"]),
+    "inj_deadtime_table3":           (["inj_deadtime_volts3"],                                            ["inj_deadtime_pressure3"]),
+    "inj_deadtime_table4":           (["inj_deadtime_volts4"],                                            ["inj_deadtime_pressure4"]),
+    # Injection timing
+    "inj_timing":                    (["inj_timing_rpm"],                                                  ["inj_timing_load"]),
+    "inj_timing_sec":                (["inj_timing_sec_rpm"],                                              ["inj_timing_sec_load"]),
+    # Long-term trim table
+    "ltt_table1":                    (["ltt_rpms"],                                                        ["ltt_loads"]),
+    # MAP prediction
+    "map_predict_lookup_table":      (["map_predict_rpm"],                                                 ["map_predict_tps"]),
+    "map_predict_lookup_table2":     (["map_predict_rpm2"],                                                ["map_predict_tps2"]),
+    # Max AFR differential
+    "maxafr1_diff":                  (["maxafr1_rpm"],                                                     ["maxafr1_load"]),
+    # Narrowband targets
+    "narrowband_tgts":               (["narrowband_tgts_rpms"],                                           ["narrowband_tgts_loads"]),
+    # Per-channel PWM output duty tables (a-f)
+    "pwm_duties_a":                  (["pwm_rpms_a"],                                                     ["pwm_loadvals_a"]),
+    "pwm_duties_b":                  (["pwm_rpms_b"],                                                     ["pwm_loadvals_b"]),
+    "pwm_duties_c":                  (["pwm_rpms_c"],                                                     ["pwm_loadvals_c"]),
+    "pwm_duties_d":                  (["pwm_rpms_d"],                                                     ["pwm_loadvals_d"]),
+    "pwm_duties_e":                  (["pwm_rpms_e"],                                                     ["pwm_loadvals_e"]),
+    "pwm_duties_f":                  (["pwm_rpms_f"],                                                     ["pwm_loadvals_f"]),
+    # PWM idle CL initial value tables (X=RPM, Y=coolant/MAT temperature)
+    "pwmidle_cl_initialvalues_duties": (["pwmidle_cl_initialvalue_rpms"],                                 ["pwmidle_cl_initialvalue_matorclt"]),
+    "pwmidle_cl_initialvalues_steps":  (["pwmidle_cl_initialvalue_rpms"],                                 ["pwmidle_cl_initialvalue_matorclt"]),
+    # Staged injection
+    "staged_percents":               (["staged_rpms"],                                                    ["staged_loads"]),
+    # VSS differential (two wheel-speed inputs)
+    "vss_diff_table":                (["vss_diff_vss1"],                                                  ["vss_diff_vss2"]),
+}
+
+# Cylinder-trim tables use a single undelimited letter suffix (a-p).
+# Build these programmatically to avoid repetition.
+for _ch in "abcdefghijklmnop":
+    _EXPLICIT_AXIS_MAP[f"inj_trim{_ch}"] = (["inj_trim_rpm"], ["inj_trim_load"])
+    _EXPLICIT_AXIS_MAP[f"spk_trim{_ch}"] = (["spk_trim_rpm"], ["spk_trim_load"])
+
+
 @dataclass
 class TuneData:
     file_path: Path
@@ -18,6 +106,7 @@ class TuneData:
     def resolve_table_axes(self, table: "TableData") -> tuple["AxisVector | None", "AxisVector | None"]:
         table_name_lower = table.name.lower()
 
+        # --- 1. VVT timing / on-off tables ---
         if table_name_lower.startswith("vvt_timing"):
             x_axis = self._pick_vector(
                 ["vvt_timing_rpm", "vvt_onoff_rpms", f"{table.name}_rpm", "vvt_rpm"],
@@ -28,6 +117,7 @@ class TuneData:
                 ["vvt_timing_load", "vvt_onoff_loads", f"{table.name}_load", "vvt_load"],
                 target_length=table.rows,
                 preferred_unit="kPa",
+                exclude_name=x_axis.name if x_axis else None,
             )
             return x_axis, y_axis
 
@@ -41,9 +131,11 @@ class TuneData:
                 ["vvt_onoff_loads", "vvt_timing_load", f"{table.name}_loads", f"{table.name}_load"],
                 target_length=table.rows,
                 preferred_unit="kPa",
+                exclude_name=x_axis.name if x_axis else None,
             )
             return x_axis, y_axis
 
+        # --- 2. Knock threshold (single axis) ---
         if table.name == "knock_thresholds":
             knock_rpm_axis = self.vectors.get("knock_rpms")
             if knock_rpm_axis is not None:
@@ -52,6 +144,43 @@ class TuneData:
                 if knock_rpm_axis.length == table.rows:
                     return None, knock_rpm_axis
 
+        # --- 3. Explicit per-table-name lookup ---
+        if table.name in _EXPLICIT_AXIS_MAP:
+            x_cands, y_cands = _EXPLICIT_AXIS_MAP[table.name]
+            x_axis = self._pick_vector(x_cands, target_length=table.cols, preferred_unit="RPM")
+            y_axis = self._pick_vector(
+                y_cands,
+                target_length=table.rows,
+                preferred_unit=None,
+                exclude_name=x_axis.name if x_axis else None,
+            )
+            return x_axis, y_axis
+
+        # --- 4. Pattern-based: derive candidate names from the table name ---
+        x_cands, y_cands = self._derive_axis_candidates(table.name)
+        x_axis = self._pick_vector(x_cands, target_length=table.cols, preferred_unit="RPM", names_only=True)
+        y_axis = self._pick_vector(
+            y_cands,
+            target_length=table.rows,
+            preferred_unit=None,
+            names_only=True,
+            exclude_name=x_axis.name if x_axis else None,
+        )
+        if x_axis is not None or y_axis is not None:
+            # Fill any missing side using the safe fallback (excludes UNALLOCATED/RAW).
+            if x_axis is None:
+                x_axis = self._pick_vector(
+                    [], table.cols, "RPM",
+                    exclude_name=y_axis.name if y_axis else None,
+                )
+            if y_axis is None:
+                y_axis = self._pick_vector(
+                    [], table.rows, None,
+                    exclude_name=x_axis.name if x_axis else None,
+                )
+            return x_axis, y_axis
+
+        # --- 5. Number-suffix approach (veTable1, advanceTable1, afrTable1, etc.) ---
         table_number = self._extract_table_number(table.name)
         preferred_prefix = self._preferred_axis_prefix(table.name)
 
@@ -69,7 +198,12 @@ class TuneData:
         candidate_y_names.extend([f"Y{table.name}", f"{table.name}Y", f"y_{table.name}", f"{table.name}_y"])
 
         x_axis = self._pick_vector(candidate_x_names, target_length=table.cols, preferred_unit="RPM")
-        y_axis = self._pick_vector(candidate_y_names, target_length=table.rows, preferred_unit=None)
+        y_axis = self._pick_vector(
+            candidate_y_names,
+            target_length=table.rows,
+            preferred_unit=None,
+            exclude_name=x_axis.name if x_axis else None,
+        )
         return x_axis, y_axis
 
     def _pick_vector(
@@ -77,21 +211,119 @@ class TuneData:
         candidate_names: list[str],
         target_length: int,
         preferred_unit: str | None,
+        exclude_name: str | None = None,
+        names_only: bool = False,
     ) -> "AxisVector | None":
+        """Return the best matching AxisVector for the given candidate names and length.
+
+        When *names_only* is True the fallback scan is skipped entirely so the
+        caller can distinguish "no named match" from "fallback match".
+        The fallback always excludes UNALLOCATED_SPACE / RAW vectors and any
+        vector identified by *exclude_name* (used to prevent X and Y resolving
+        to the same vector).
+        """
         for name in candidate_names:
             vector = self.vectors.get(name)
             if vector and vector.length == target_length:
-                return vector
+                if exclude_name is None or vector.name != exclude_name:
+                    return vector
 
+        if names_only:
+            return None
+
+        # Fallback: scan all vectors by unit preference, skipping bad candidates.
         fallback: AxisVector | None = None
         for vector in self.vectors.values():
             if vector.length != target_length:
+                continue
+            if exclude_name and vector.name == exclude_name:
+                continue
+            if self._is_unallocated_vector(vector):
                 continue
             if preferred_unit and vector.units and vector.units.upper() == preferred_unit.upper():
                 return vector
             if fallback is None:
                 fallback = vector
         return fallback
+
+    @staticmethod
+    def _is_unallocated_vector(vector: "AxisVector") -> bool:
+        """Return True for placeholder / unallocated vectors that should never be used as axes."""
+        name_upper = vector.name.upper()
+        if "UNALLOCATED" in name_upper:
+            return True
+        if vector.units and vector.units.upper() == "RAW":
+            return True
+        return False
+
+    @staticmethod
+    def _derive_axis_candidates(table_name: str) -> tuple[list[str], list[str]]:
+        """Generate RPM-axis and load/map-axis candidate names from table-name patterns.
+
+        This covers tables whose axis vectors share a common name stem with the
+        table itself (e.g. ``dwell_table_values`` → ``dwell_table_rpms`` /
+        ``dwell_table_loads``), and cylinder-trim tables that use an undelimited
+        single-letter suffix (``inj_trima`` → ``inj_trim_rpm`` / ``inj_trim_load``).
+        """
+        x_cands: list[str] = []
+        y_cands: list[str] = []
+
+        def add_rpm_variants(stem: str) -> None:
+            for sfx in ("_rpm", "_rpms", "_rpmbin", "_rpmbins"):
+                x_cands.append(stem + sfx)
+
+        def add_load_variants(stem: str) -> None:
+            for sfx in ("_load", "_loads", "_kpa", "_kpas", "_tps", "_tpss",
+                        "_map", "_pressure", "_volts", "_loadvals"):
+                y_cands.append(stem + sfx)
+
+        # Direct: {table_name}_rpm / {table_name}_load
+        add_rpm_variants(table_name)
+        add_load_variants(table_name)
+
+        # Strip common MS3 table-name suffixes and try stem variants.
+        stripped = re.sub(
+            r"(_lookup_table\d*|_table_values?\d*|_table\d*|_values?\d*"
+            r"|_targs?\d*|_targets?\d*|_percents?\d*|_diff\d*"
+            r"|_duties?\d*|_duty\d*)$",
+            "",
+            table_name,
+            flags=re.IGNORECASE,
+        )
+        if stripped and stripped != table_name:
+            add_rpm_variants(stripped)
+            add_load_variants(stripped)
+
+        # Cylinder-trim pattern: {stem}_trim{letter a-p} (no underscore before letter).
+        m_trim = re.match(r"^(.+_trim)([a-p])$", table_name)
+        if m_trim:
+            stem = m_trim.group(1)
+            add_rpm_variants(stem)
+            add_load_variants(stem)
+
+        # Underscore-delimited single-letter suffix: {stem}_{letter a-p}
+        m_letter = re.match(r"^(.+)_([a-p])$", table_name)
+        if m_letter:
+            stem = m_letter.group(1)
+            letter = m_letter.group(2)
+            add_rpm_variants(stem)
+            add_load_variants(stem)
+            # Also try per-channel variants: {stem}_rpm_{letter}
+            for sfx in ("_rpm", "_rpms"):
+                x_cands.append(f"{stem}{sfx}_{letter}")
+            for sfx in ("_load", "_loads", "_loadvals"):
+                y_cands.append(f"{stem}{sfx}_{letter}")
+
+        # Numbered suffix: try both with and without the trailing number.
+        m_num = re.match(r"^(.+?)(\d+)$", table_name)
+        if m_num:
+            stem, num = m_num.group(1), m_num.group(2)
+            add_rpm_variants(stem + num)
+            add_load_variants(stem + num)
+            add_rpm_variants(stem)
+            add_load_variants(stem)
+
+        return x_cands, y_cands
 
     @staticmethod
     def _extract_table_number(table_name: str) -> str | None:

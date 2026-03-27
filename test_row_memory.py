@@ -341,6 +341,60 @@ def test_custom_identifier_series_is_computed_and_plotted() -> None:
     window.close()
 
 
+def test_preferences_dialog_persists_plugins_and_table_enablement(tmp_path) -> None:
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists(), "Test tune not found at tuning_data/SP_NB2_Rev1.msq"
+    assert log_path.exists(), "Test log not found at tuning_data/SP.msl"
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    table_names = sorted(window.tune_data.tables.keys())
+    table_display_names = {table_name: table_name for table_name in table_names}
+    table_dimensions = {
+        table_name: (table.rows == 1 or table.cols == 1)
+        for table_name, table in window.tune_data.tables.items()
+    }
+    log_channel_names = [str(column) for column in window.log_df.columns]
+
+    dialog = TableLogChannelPreferencesDialog(
+        table_names=table_names,
+        table_dimensions=table_dimensions,
+        table_display_names=table_display_names,
+        log_channel_names=log_channel_names,
+        current_preferences={
+            "veTable1": {},
+            "__plugins__": {
+                "My VE Plugin": {"type": "ve_row_best_fit_suggestion", "button_label": "Run My VE Plugin"},
+            },
+            "__table_plugins__": {
+                "veTable1": {"My VE Plugin": True},
+            },
+        },
+        current_preferences_path=tmp_path / "current_preferences.json",
+        initial_table_name="veTable1",
+        parent=window,
+    )
+
+    prefs = dialog.preferences()
+    plugins = prefs.get("__plugins__", {})
+    assert isinstance(plugins, dict)
+    assert "My VE Plugin" in plugins
+    assert "VE Row Best-Fit Suggestion" in plugins
+
+    table_plugins = prefs.get("__table_plugins__", {})
+    assert isinstance(table_plugins, dict)
+    assert isinstance(table_plugins.get("veTable1"), dict)
+    assert bool(table_plugins["veTable1"].get("My VE Plugin", False))
+
+    window.close()
+
+
 def test_selected_scatter_point_text_only_shows_configured_detail_channels() -> None:
     _get_app()
     window = MainWindow()
@@ -396,6 +450,175 @@ def test_selected_table_point_text_only_shows_configured_table_channels() -> Non
     assert "RPM:" not in text
     assert "MAP:" not in text
     assert "Configured data:" not in text
+
+    window.close()
+
+
+def test_map_tolerance_per_channel_saves_and_reloads(tmp_path) -> None:
+    """MAP tolerance is stored per-identifier and reloaded into the spinbox."""
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists()
+    assert log_path.exists()
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    table_names = sorted(window.tune_data.tables.keys())
+    table_display_names = {n: n for n in table_names}
+    table_dimensions = {
+        n: (t.rows == 1 or t.cols == 1)
+        for n, t in window.tune_data.tables.items()
+    }
+    log_channel_names = [str(c) for c in window.log_df.columns]
+
+    # Prefs with a non-zero map_tolerance for one channel
+    initial_channel = log_channel_names[0]
+    initial_prefs = {
+        "veTable1": {
+            initial_channel: {
+                "show_in_scatterplot": True,
+                "show_when_point_selected": False,
+                "scatter_color": "#ff0000",
+                "scatter_opacity": 70,
+                "map_tolerance": 15,
+            }
+        }
+    }
+
+    dialog = TableLogChannelPreferencesDialog(
+        table_names=table_names,
+        table_dimensions=table_display_names,
+        table_display_names=table_display_names,
+        log_channel_names=log_channel_names,
+        current_preferences=initial_prefs,
+        current_preferences_path=tmp_path / "current_preferences.json",
+        initial_table_name="veTable1",
+        parent=window,
+    )
+
+    # The spinbox for the first channel should reflect the saved value
+    from PySide6.QtWidgets import QSpinBox
+    channels_table = dialog.channels_table
+    tol_spin = None
+    for row in range(channels_table.rowCount()):
+        item = channels_table.item(row, 0)
+        if item is not None and item.text() == initial_channel:
+            tol_spin = channels_table.cellWidget(row, 5)
+            break
+
+    assert tol_spin is not None, "MAP tolerance spinbox not found for channel"
+    assert isinstance(tol_spin, QSpinBox)
+    assert tol_spin.value() == 15, f"Expected 15, got {tol_spin.value()}"
+
+    # preferences() should round-trip the value
+    saved = dialog.preferences()
+    ve_prefs = saved.get("veTable1", {})
+    channel_prefs = ve_prefs.get(initial_channel, {})
+    assert channel_prefs.get("map_tolerance") == 15, f"Round-tripped value wrong: {channel_prefs}"
+
+    window.close()
+
+
+def test_map_tolerance_filter_narrows_scatter_points() -> None:
+    """A per-channel map_tolerance of 1 kPa produces fewer scatter points than 20 kPa."""
+    _get_app()
+    window = MainWindow()
+
+    tune_path = Path("tuning_data/SP_NB2_Rev1.msq")
+    log_path = Path("tuning_data/SP.msl")
+    assert tune_path.exists()
+    assert log_path.exists()
+
+    window.tune_data = TuneLoader().load(tune_path)
+    parse_result = window.log_loader.load_log_with_report(log_path)
+    window.log_df = parse_result.dataframe
+
+    window.current_table = window.tune_data.tables["veTable1"]
+    window.current_x_axis, window.current_y_axis = window.tune_data.resolve_table_axes(window.current_table)
+    window.selected_table_row_idx = 0
+    window.pending_row_values = [float(v) for v in window.current_table.values[0]]
+
+    log_channel_names = [str(c) for c in window.log_df.columns]
+    test_channel = log_channel_names[0]
+
+    map_value = float(window.current_y_axis.values[0])
+    rpm_values = [float(v) for v in window.current_x_axis.values]
+
+    rpm_channel = next(
+        (c for c in window.log_df.columns if "rpm" in str(c).lower() or "engine speed" in str(c).lower()),
+        None,
+    )
+    map_channel = next(
+        (c for c in window.log_df.columns if "map" in str(c).lower()),
+        None,
+    )
+    assert rpm_channel and map_channel, "RPM or MAP channel not found in log"
+
+    rpm_series = window._to_numeric_series(window.log_df[rpm_channel])
+    map_series = window._to_numeric_series(window.log_df[map_channel])
+    assert rpm_series is not None and map_series is not None
+
+    global_tol = 20.0
+    global_map_mask = (map_series >= map_value - global_tol) & (map_series <= map_value + global_tol)
+    filtered_rpm_values = [float(v) for v in rpm_series[global_map_mask]]
+    filtered_map_values = [float(v) for v in map_series[global_map_mask]]
+
+    def _make_base_point_set():
+        return [
+            {
+                "series_id": "table",
+                "name": "Selected Row Data",
+                "rpm": rpm_values,
+                "ve": window.pending_row_values,
+                "map": [map_value] * len(rpm_values),
+                "ve_raw": window.pending_row_values,
+                "ve_scaled": window.pending_row_values,
+                "afr": [None] * len(rpm_values),
+                "afr_predicted": [None] * len(rpm_values),
+                "afr_target": [None] * len(rpm_values),
+                "afr_error": [None] * len(rpm_values),
+            }
+        ]
+
+    common_kwargs = dict(
+        table_name="veTable1",
+        table_rpm_values=rpm_values,
+        map_mask=global_map_mask,
+        filtered_rpm_values=filtered_rpm_values,
+        filtered_map_values=filtered_map_values,
+        map_value=map_value,
+        map_series=map_series,
+        rpm_series=rpm_series,
+    )
+
+    def run_with_tolerance(tol: int):
+        window.table_log_channel_preferences = {
+            "veTable1": {
+                test_channel: {
+                    "show_in_scatterplot": True,
+                    "show_when_point_selected": False,
+                    "scatter_color": "",
+                    "scatter_opacity": 70,
+                    "map_tolerance": tol,
+                }
+            }
+        }
+        ps = _make_base_point_set()
+        window._apply_table_log_channel_preferences_to_payload(point_sets=ps, **common_kwargs)
+        scatter = [p for p in ps if p.get("series_id") == f"log::{test_channel}"]
+        return len(scatter[0]["rpm"]) if scatter else 0
+
+    tight_count = run_with_tolerance(1)
+    global_count = run_with_tolerance(0)  # 0 = use global 20 kPa band
+
+    assert tight_count <= global_count, (
+        f"Tight 1 kPa band ({tight_count} pts) should have ≤ points than global band ({global_count} pts)"
+    )
 
     window.close()
 

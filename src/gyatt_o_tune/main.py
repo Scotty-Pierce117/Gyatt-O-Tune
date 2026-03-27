@@ -49,6 +49,26 @@ def _open_startup_tune_and_layout(window: MainWindow, selected_tune: Path) -> No
         window._load_default_window_layout()
 
 
+def _center_dialog_on_primary_screen(app: QApplication, dialog: QDialog) -> None:
+    primary = app.primaryScreen()
+    if primary is None:
+        return
+    screen_rect = primary.availableGeometry()
+    dialog.adjustSize()
+    width = dialog.width()
+    height = dialog.height()
+    x = screen_rect.x() + max(0, (screen_rect.width() - width) // 2)
+    y = screen_rect.y() + max(0, (screen_rect.height() - height) // 2)
+    dialog.move(x, y)
+
+
+def _show_window_maximized_on_primary(app: QApplication, window: MainWindow) -> None:
+    primary = app.primaryScreen()
+    if primary is not None:
+        window.setGeometry(primary.availableGeometry())
+    window.showMaximized()
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Gyatt-O-Tune")
@@ -71,6 +91,7 @@ def main() -> int:
             app.windowIcon(),
             default_browse_dir=_default_browse_dir(recent_tunes),
         )
+        _center_dialog_on_primary_screen(app, startup_dialog)
         if startup_dialog.exec() != QDialog.DialogCode.Accepted or startup_dialog.selected_tune_path is None:
             return 0
         selected_tune = startup_dialog.selected_tune_path
@@ -78,7 +99,7 @@ def main() -> int:
     window = MainWindow()
     if icon_path is not None:
         window.setWindowIcon(QIcon(str(icon_path)))
-    window.show()
+    _show_window_maximized_on_primary(app, window)
 
     if selected_tune is not None:
         QTimer.singleShot(0, lambda: _open_startup_tune_and_layout(window, selected_tune))

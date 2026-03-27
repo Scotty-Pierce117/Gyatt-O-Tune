@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ast
+import time as _time_mod
 from pathlib import Path
 from typing import Any, Callable
 
@@ -10,6 +11,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -28,8 +31,12 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
+    QStyle,
+    QSizePolicy,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -213,16 +220,17 @@ class RowVisualizationPanel(QGroupBox):
         self.on_point_selected: Any = None
         self.on_point_adjust_requested: Any = None
         self.on_visibility_changed: Any = None
+        self.on_scatter_preferences_requested: Any = None
+        self.on_table_preferences_requested: Any = None
+        self.on_log_playback_toggled: Any = None
+        self.get_log_playback_state: Any = None
+        self.on_plot_all_data_requested: Any = None
         self.legend: Any = None
         self._table_type = "generic"
         self._y_label_text = "Value"
         self._selected_point_text = "<span style='color:#f0f0f0'>Selected point: none</span>"
         self._stats_tooltip_text = ""
         self.dynamic_scatter_items: dict[str, Any] = {}
-        
-        # Visibility toggles for different data series
-        self._show_table = True
-        self._show_average = True
 
         layout = QVBoxLayout(self)
 
@@ -238,8 +246,6 @@ class RowVisualizationPanel(QGroupBox):
 
         self.table_curve = pg.PlotCurveItem(pen=pg.mkPen(255, 40, 40, width=5), name="Selected Row Data")
         self.table_scatter = pg.ScatterPlotItem(size=8, name="Selected Row Points")
-        self.average_curve = pg.PlotCurveItem(pen=pg.mkPen(235, 170, 85, width=3), name="Predicted VE")
-        self.average_scatter = pg.ScatterPlotItem(pen=pg.mkPen(235, 170, 85, 220, width=2), brush=pg.mkBrush(235, 170, 85, 200), size=8, name="Predicted VE Points")
         self.selected_marker = pg.ScatterPlotItem(
             pen=pg.mkPen(255, 255, 255, 255, width=2),
             brush=pg.mkBrush(255, 225, 120, 255),
@@ -258,28 +264,94 @@ class RowVisualizationPanel(QGroupBox):
         view_box = self.plot.getPlotItem().vb
         if view_box is not None:
             view_box.sigRangeChanged.connect(self._on_plot_range_changed)
-        
-        # Add toggle controls for each data series
-        toggle_layout = QHBoxLayout()
-        toggle_layout.setContentsMargins(0, 4, 0, 0)
-        
-        self.check_table = QCheckBox("Selected Row")
-        self.check_table.setChecked(True)
-        self.check_table.toggled.connect(self._on_toggle_table)
-        toggle_layout.addWidget(self.check_table)
-        
-        self.check_average = QCheckBox("Predicted VE")
-        self.check_average.setChecked(True)
-        self.check_average.toggled.connect(self._on_toggle_average)
-        toggle_layout.addWidget(self.check_average)
 
-        self._check_by_series: dict[str, QCheckBox] = {
-            "table": self.check_table,
-            "average": self.check_average,
-        }
-        
-        toggle_layout.addStretch()
-        layout.addLayout(toggle_layout)
+        # --- Playback controls ---
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(50)  # ~20fps update
+        self._playback_timer.timeout.connect(self._playback_tick)
+        self._playback_state = "stopped"  # "stopped" | "playing" | "paused"
+        self._playback_start_time: float = 0.0
+        self._playback_elapsed: float = 0.0  # seconds elapsed since playback start point
+        self._playback_all_times: list[float] = []  # sorted unique times across all log series
+        self._playback_series_time_data: dict[str, list[float]] = {}  # series_id -> time values
+        self._playback_current_wall_start: float = 0.0  # monotonic ref for live ticking
+        self._playback_max_time: float = 0.0
+        self._has_playback_time_data = False
+        self._show_playback_controls = True
+        self._playback_speed: float = 1.0
+        self._speed_steps: list[float] = [1.0, 2.0, 5.0, 10.0, 20.0]
+        self._speed_index: int = 0
+
+        playback_layout = QHBoxLayout()
+        playback_layout.setContentsMargins(10, 8, 10, 8)
+        playback_layout.setSpacing(8)
+
+        self.playback_controls_bar = QWidget()
+        self.playback_controls_bar.setObjectName("rowVizPlaybackBar")
+
+        self.btn_play = QPushButton("")
+        self.btn_play.setObjectName("rowVizPlaybackPlayButton")
+        self.btn_play.setFixedSize(34, 30)
+        self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play.setCheckable(True)
+        self.btn_play.setToolTip("Play / Resume playback")
+        self.btn_play.clicked.connect(self._on_playback_play)
+        playback_layout.addWidget(self.btn_play)
+
+        self.btn_pause = QPushButton("")
+        self.btn_pause.setObjectName("rowVizPlaybackPauseButton")
+        self.btn_pause.setFixedSize(34, 30)
+        self.btn_pause.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        self.btn_pause.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.setToolTip("Pause playback")
+        self.btn_pause.clicked.connect(self._on_playback_pause)
+        playback_layout.addWidget(self.btn_pause)
+
+        self.btn_stop = QPushButton("")
+        self.btn_stop.setObjectName("rowVizPlaybackStopButton")
+        self.btn_stop.setFixedSize(34, 30)
+        self.btn_stop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setCheckable(True)
+        self.btn_stop.setToolTip("Stop playback and show all data")
+        self.btn_stop.clicked.connect(self._on_playback_stop)
+        playback_layout.addWidget(self.btn_stop)
+
+        self.btn_speed = QPushButton("1x")
+        self.btn_speed.setObjectName("rowVizPlaybackSpeedButton")
+        self.btn_speed.setFixedSize(46, 30)
+        self.btn_speed.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_speed.setToolTip("Cycle playback speed: 1x \u2192 2x \u2192 5x \u2192 10x \u2192 20x")
+        self.btn_speed.clicked.connect(self._on_playback_speed_toggle)
+        playback_layout.addWidget(self.btn_speed)
+
+        self.playback_slider = QSlider(Qt.Orientation.Horizontal)
+        self.playback_slider.setMinimum(0)
+        self.playback_slider.setMaximum(1000)
+        self.playback_slider.setValue(0)
+        self.playback_slider.setToolTip("Scrub playback position")
+        self.playback_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.playback_slider.sliderReleased.connect(self._on_slider_released)
+        self.playback_slider.valueChanged.connect(self._on_slider_value_changed)
+        self._slider_dragging = False
+        playback_layout.addWidget(self.playback_slider, 1)
+
+        self.playback_time_label = QLabel("0.0s / 0.0s")
+        self.playback_time_label.setFixedWidth(110)
+        playback_layout.addWidget(self.playback_time_label)
+
+        self.playback_widget = QWidget()
+        self.playback_controls_bar.setLayout(playback_layout)
+        self._apply_playback_button_style()
+        playback_widget_layout = QVBoxLayout(self.playback_widget)
+        playback_widget_layout.setContentsMargins(0, 0, 0, 0)
+        playback_widget_layout.setSpacing(0)
+        playback_widget_layout.addWidget(self.playback_controls_bar)
+        self.playback_widget.setVisible(False)  # hidden until log scatter data is loaded
+        self._update_playback_button_states()
+        layout.addWidget(self.playback_widget)
 
         self._mouse_proxy = pg.SignalProxy(
             self.plot.scene().sigMouseMoved,
@@ -287,6 +359,9 @@ class RowVisualizationPanel(QGroupBox):
             slot=self._on_mouse_moved,
         )
         self.plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        self._dynamic_menu_actions: list[Any] = []
+        self._context_menu_identifier: str | None = None
+        self._setup_viewbox_menu_hook()
         self.plot.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.plot.installEventFilter(self)
         self.plot.viewport().installEventFilter(self)
@@ -316,6 +391,82 @@ class RowVisualizationPanel(QGroupBox):
 
     def _on_plot_range_changed(self, *args: Any) -> None:
         self._position_selected_point_overlay()
+
+    def set_playback_controls_enabled(self, enabled: bool) -> None:
+        self._show_playback_controls = bool(enabled)
+        self._refresh_playback_widget_visibility()
+
+    def _refresh_playback_widget_visibility(self) -> None:
+        self.playback_widget.setVisible(self._show_playback_controls)
+
+    def _apply_playback_button_style(self) -> None:
+        self.playback_controls_bar.setStyleSheet(
+            "QWidget#rowVizPlaybackBar {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #212734, stop:1 #2a3142);"
+            "border: 1px solid #3c465d;"
+            "border-radius: 12px;"
+            "}"
+            "QWidget#rowVizPlaybackBar QLabel {"
+            "color: #d3dbea;"
+            "font-size: 11px;"
+            "font-weight: 600;"
+            "}"
+            "QWidget#rowVizPlaybackBar QSlider::groove:horizontal {"
+            "height: 6px;"
+            "background: #1b212f;"
+            "border: 1px solid #394359;"
+            "border-radius: 3px;"
+            "}"
+            "QWidget#rowVizPlaybackBar QSlider::sub-page:horizontal {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5db1ff, stop:1 #7fd0ff);"
+            "border-radius: 3px;"
+            "}"
+            "QWidget#rowVizPlaybackBar QSlider::handle:horizontal {"
+            "width: 14px;"
+            "margin: -5px 0;"
+            "border-radius: 7px;"
+            "border: 1px solid #9ccff4;"
+            "background: #d4efff;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton {"
+            "background: #2f394c;"
+            "color: #ebf2ff;"
+            "border: 1px solid #4d5a74;"
+            "border-radius: 8px;"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            "padding: 0 2px;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton:hover {"
+            "background: #3b4960;"
+            "border-color: #6a7da0;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton:pressed {"
+            "background: #273043;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton:disabled {"
+            "background: #2a2f39;"
+            "color: #8a95ab;"
+            "border-color: #454d5f;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton:checked {"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2f79ff, stop:1 #3ea8ff);"
+            "color: #ffffff;"
+            "border-color: #85bcff;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton#rowVizPlaybackStopButton:checked {"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #d9506f, stop:1 #c64158);"
+            "border-color: #f08aa0;"
+            "}"
+            "QWidget#rowVizPlaybackBar QPushButton#rowVizPlaybackSpeedButton {"
+            "font-size: 12px;"
+            "}"
+        )
+
+    def _update_playback_button_states(self) -> None:
+        self.btn_play.setChecked(self._playback_state == "playing")
+        self.btn_pause.setChecked(self._playback_state == "paused")
+        self.btn_stop.setChecked(self._playback_state == "stopped")
 
     def eventFilter(self, watched: Any, event: Any) -> bool:  # type: ignore[override]
         if watched in {self.plot, self.plot.viewport()}:
@@ -388,67 +539,39 @@ class RowVisualizationPanel(QGroupBox):
             return index
         return None
 
-    def _on_toggle_table(self, checked: bool) -> None:
-        self._show_table = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
-    def _on_toggle_average(self, checked: bool) -> None:
-        self._show_average = checked
-        self._refresh_visibility()
-        self._emit_visibility_changed()
-
     def _emit_visibility_changed(self) -> None:
         if callable(self.on_visibility_changed):
             self.on_visibility_changed(self.current_series_visibility())
 
     def _refresh_visibility(self) -> None:
-        """Update plot item visibility based on checkboxes."""
-        self.table_curve.show() if self._show_table else self.table_curve.hide()
-        self.table_scatter.show() if self._show_table else self.table_scatter.hide()
-        self.average_curve.show() if self._show_average else self.average_curve.hide()
-        self.average_scatter.show() if self._show_average else self.average_scatter.hide()
+        """Update plot item visibility."""
+        self.table_curve.show()
+        self.table_scatter.show()
         for scatter_item in self.dynamic_scatter_items.values():
             scatter_item.show()
-        # Keep hidden series fully non-rendered and non-pickable.
         self._refresh_point_styles()
         self._refresh_legend()
 
     def _is_series_visible(self, series_id: str) -> bool:
-        visibility = {
-            "table": self._show_table,
-            "average": self._show_average,
-        }
-        return bool(visibility.get(series_id, True))
+        return True
 
     def current_series_visibility(self) -> dict[str, bool]:
-        return {
-            "table": self._show_table,
-            "average": self._show_average,
-        }
+        return {}
 
     def configure_series_controls(
         self,
         available_series: list[str],
         preferred_visibility: dict[str, bool] | None = None,
     ) -> None:
-        preferred_visibility = preferred_visibility or {}
-        available = set(available_series)
-        for series_id, check in self._check_by_series.items():
-            is_available = series_id in available
-            check.setVisible(is_available)
-            if not is_available:
-                continue
-            check.blockSignals(True)
-            check.setChecked(bool(preferred_visibility.get(series_id, check.isChecked())))
-            check.blockSignals(False)
-
-        self._show_table = self.check_table.isChecked()
-        self._show_average = self.check_average.isChecked()
         self._refresh_visibility()
         self._emit_visibility_changed()
 
     def clear_visualization(self, title: str = "No data selected", stats_text: str = "") -> None:
+        if self._playback_state != "stopped":
+            self._playback_timer.stop()
+            self._playback_state = "stopped"
+            self._playback_elapsed = 0.0
+            self._update_playback_button_states()
         self._selected_point = None
         self._point_sets = []
         self.dynamic_scatter_items = {}
@@ -461,9 +584,16 @@ class RowVisualizationPanel(QGroupBox):
         self.plot.setLabel('bottom', 'RPM')
         self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
         self._add_plot_items()
+        self._collect_playback_time_data()
         self._apply_view_all()
 
     def set_row_data(self, payload: dict[str, Any], auto_view_all: bool = True) -> None:
+        # Stop any active playback when new data arrives
+        if self._playback_state != "stopped":
+            self._playback_timer.stop()
+            self._playback_state = "stopped"
+            self._playback_elapsed = 0.0
+            self._update_playback_button_states()
         self._selected_point = None
         self._point_sets = list(payload.get("point_sets", []))
         self._table_type = str(payload.get("table_type", "generic"))
@@ -481,6 +611,7 @@ class RowVisualizationPanel(QGroupBox):
         self._add_plot_items()
         self._refresh_point_styles()
         self._refresh_visibility()
+        self._collect_playback_time_data()
         if auto_view_all:
             self._apply_view_all()
 
@@ -496,8 +627,6 @@ class RowVisualizationPanel(QGroupBox):
     def _add_plot_items(self) -> None:
         self.plot.addItem(self.table_curve)
         self.plot.addItem(self.table_scatter)
-        self.plot.addItem(self.average_curve)
-        self.plot.addItem(self.average_scatter)
         self.dynamic_scatter_items = {}
         dynamic_palette = [
             (110, 210, 200),
@@ -561,8 +690,6 @@ class RowVisualizationPanel(QGroupBox):
     def _apply_item_z_order(self) -> None:
         for scatter_item in self.dynamic_scatter_items.values():
             scatter_item.setZValue(12)
-        self.average_curve.setZValue(30)
-        self.average_scatter.setZValue(31)
         self.table_curve.setZValue(32)
         self.table_scatter.setZValue(33)
         self.selected_marker.setZValue(40)
@@ -585,14 +712,9 @@ class RowVisualizationPanel(QGroupBox):
             return
 
         self.legend.clear()
-        entries = [
-            ("table", self.table_curve, "Selected Row", self._show_table),
-            ("average", self.average_curve, "Predicted VE", self._show_average),
-        ]
 
-        for series_id, item, label, is_enabled in entries:
-            if is_enabled and self._series_has_points(series_id):
-                self.legend.addItem(item, label)
+        if self._series_has_points("table"):
+            self.legend.addItem(self.table_curve, "Selected Row")
 
         for series in self._point_sets:
             series_id = str(series.get("series_id", ""))
@@ -612,33 +734,27 @@ class RowVisualizationPanel(QGroupBox):
 
     def _refresh_point_styles(self) -> None:
         table_series = self._get_series("table")
-        average_series = self._get_series("average")
 
-        if table_series is not None and self._show_table:
+        if table_series is not None:
             self.table_curve.setData(table_series["rpm"], table_series["ve"])
             self.table_scatter.setData(x=table_series["rpm"], y=table_series["ve"])
         else:
             self.table_curve.setData([], [])
             self.table_scatter.setData([], [])
 
-        if average_series is not None and self._show_average:
-            self.average_curve.setData(average_series["rpm"], average_series["ve"])
-            self.average_scatter.setData(x=average_series["rpm"], y=average_series["ve"])
-        else:
-            self.average_curve.setData([], [])
-            self.average_scatter.setData([], [])
-
-        for series in self._point_sets:
-            series_id = str(series.get("series_id", ""))
-            if not series_id.startswith("log::"):
-                continue
-            item = self.dynamic_scatter_items.get(series_id)
-            if item is None:
-                continue
-            if self._is_series_visible(series_id):
-                item.setData(x=series.get("rpm", []), y=series.get("ve", []))
-            else:
-                item.setData([], [])
+        # During active playback, defer log scatter rendering to _apply_playback_at_elapsed
+        if not self._is_playback_active():
+            for series in self._point_sets:
+                series_id = str(series.get("series_id", ""))
+                if not series_id.startswith("log::"):
+                    continue
+                item = self.dynamic_scatter_items.get(series_id)
+                if item is None:
+                    continue
+                if self._is_series_visible(series_id):
+                    item.setData(x=series.get("rpm", []), y=series.get("ve", []))
+                else:
+                    item.setData([], [])
 
         self._refresh_selected_marker()
         self._refresh_legend()
@@ -724,6 +840,14 @@ class RowVisualizationPanel(QGroupBox):
                 if isinstance(channel_values, list) and 0 <= index < len(channel_values):
                     detail_rows.append((f"{channel_name}:", self._format_value(channel_values[index])))
 
+        count_channels = series.get("count_channels", {})
+        if isinstance(count_channels, dict):
+            for channel_name in sorted(count_channels.keys()):
+                channel_values = count_channels.get(channel_name)
+                if isinstance(channel_values, list) and 0 <= index < len(channel_values):
+                    cnt = channel_values[index]
+                    detail_rows.append((f"{channel_name}:", str(int(cnt)) if cnt is not None else "n/a"))
+
         detail_channels = series.get("detail_channels", {})
         if isinstance(detail_channels, dict):
             for channel_name in sorted(detail_channels.keys()):
@@ -777,6 +901,19 @@ class RowVisualizationPanel(QGroupBox):
             return
 
         click_pos = evt.scenePos()
+
+        # Bottom-left corner click (where the two axis lines meet) triggers "Plot All Data".
+        vb_rect = vb.sceneBoundingRect()
+        plot_rect = plot_item.sceneBoundingRect()
+        if (
+            click_pos.x() < vb_rect.left()
+            and click_pos.y() > vb_rect.bottom()
+            and plot_rect.contains(click_pos)
+            and callable(self.on_plot_all_data_requested)
+        ):
+            self.on_plot_all_data_requested()
+            return
+
         if not plot_item.sceneBoundingRect().contains(click_pos):
             return
         self.plot.setFocus()
@@ -825,6 +962,386 @@ class RowVisualizationPanel(QGroupBox):
             rpm_value = float(rpm_values[index])
         if callable(self.on_point_selected):
             self.on_point_selected(series_id, index, rpm_value)
+
+    def _setup_viewbox_menu_hook(self) -> None:
+        """Patch ViewBox context-menu so our actions are always appended last."""
+        plot_item = self.plot.getPlotItem()
+        vb = plot_item.vb
+        original_raise = vb.raiseContextMenu
+        panel = self  # captured reference
+
+        def _append_dynamic_actions() -> None:
+            # Remove any actions we added during the previous right-click.
+            for action in panel._dynamic_menu_actions:
+                vb.menu.removeAction(action)
+            panel._dynamic_menu_actions.clear()
+
+            identifier = panel._context_menu_identifier
+            sep = vb.menu.addSeparator()
+            panel._dynamic_menu_actions = [sep]
+
+            if identifier is not None and callable(panel.on_scatter_preferences_requested):
+                act = vb.menu.addAction(f'"{identifier}" Preferences...')
+                # Default-argument capture so the lambda closes over the correct value.
+                act.triggered.connect(lambda checked=False, ident=identifier: panel.on_scatter_preferences_requested(ident))
+                panel._dynamic_menu_actions.append(act)
+            if callable(panel.on_table_preferences_requested):
+                act2 = vb.menu.addAction("Table Preferences...")
+                act2.triggered.connect(lambda checked=False: panel.on_table_preferences_requested())
+                panel._dynamic_menu_actions.append(act2)
+            if callable(panel.on_log_playback_toggled):
+                act_pb = vb.menu.addAction("Log Playback")
+                act_pb.setCheckable(True)
+                act_pb.setChecked(bool(callable(panel.get_log_playback_state) and panel.get_log_playback_state()))
+                act_pb.triggered.connect(lambda checked=False, a=act_pb: panel.on_log_playback_toggled(a.isChecked()))
+                panel._dynamic_menu_actions.append(act_pb)
+            if callable(panel.on_plot_all_data_requested):
+                act3 = vb.menu.addAction("Plot All Data")
+                act3.triggered.connect(lambda checked=False: panel.on_plot_all_data_requested())
+                panel._dynamic_menu_actions.append(act3)
+
+            # If we only added the separator (no callbacks set), remove it to keep the menu clean.
+            if len(panel._dynamic_menu_actions) == 1:
+                vb.menu.removeAction(sep)
+                panel._dynamic_menu_actions.clear()
+
+        vb.menu.aboutToShow.connect(_append_dynamic_actions)
+
+        def _patched_raise(ev: Any) -> Any:
+            panel._context_menu_identifier = panel._find_nearest_log_identifier(ev.scenePos(), vb, plot_item)
+            return original_raise(ev)
+
+        vb.raiseContextMenu = _patched_raise
+
+    def _find_nearest_log_identifier(self, scene_pos: Any, vb: Any, plot_item: Any) -> str | None:
+        """Return the identifier of the closest visible log:: scatter point, or None if too far."""
+        if not plot_item.sceneBoundingRect().contains(scene_pos):
+            return None
+
+        click_view = vb.mapSceneToView(scene_pos)
+        click_rpm = float(click_view.x())
+        click_val = float(click_view.y())
+
+        view_rect = vb.viewRect()
+        scene_rect = plot_item.sceneBoundingRect()
+        x_per_px = max(float(view_rect.width()) / max(float(scene_rect.width()), 1.0), 1e-9)
+        y_per_px = max(float(view_rect.height()) / max(float(scene_rect.height()), 1.0), 1e-9)
+
+        nearest: tuple[float, str] | None = None
+        for series in self._point_sets:
+            series_id = str(series.get("series_id", ""))
+            if not series_id.startswith("log::"):
+                continue
+            if not self._is_series_visible(series_id):
+                continue
+            for rpm, ve in zip(series.get("rpm", []), series.get("ve", [])):
+                dx_px = (float(rpm) - click_rpm) / x_per_px
+                dy_px = (float(ve) - click_val) / y_per_px
+                distance = dx_px ** 2 + dy_px ** 2
+                if nearest is None or distance < nearest[0]:
+                    nearest = (distance, series_id)
+
+        if nearest is not None and nearest[0] <= 24.0 ** 2:
+            return nearest[1][len("log::"):]
+        return None
+
+    # ------------------------------------------------------------------
+    # Playback feature
+    # ------------------------------------------------------------------
+
+    def _collect_playback_time_data(self) -> None:
+        """Extract time arrays from log:: series in _point_sets and prepare playback state."""
+        self._playback_series_time_data.clear()
+        all_times: list[float] = []
+        has_time = False
+        for series in self._point_sets:
+            series_id = str(series.get("series_id", ""))
+            if not series_id.startswith("log::"):
+                continue
+            time_values = series.get("time")
+            if not time_values or not isinstance(time_values, list):
+                continue
+            valid = [float(t) for t in time_values if t is not None]
+            if not valid:
+                continue
+            has_time = True
+            self._playback_series_time_data[series_id] = [float(t) for t in time_values]
+            all_times.extend(valid)
+
+        if all_times:
+            all_times.sort()
+            self._playback_all_times = all_times
+            self._playback_max_time = all_times[-1]
+            self._playback_start_time = all_times[0]
+        else:
+            self._playback_all_times = []
+            self._playback_max_time = 0.0
+            self._playback_start_time = 0.0
+
+        self._has_playback_time_data = has_time
+        self._refresh_playback_widget_visibility()
+        self.btn_play.setEnabled(has_time)
+        self.btn_pause.setEnabled(has_time)
+        self.btn_stop.setEnabled(has_time)
+        self.btn_speed.setEnabled(has_time)
+        self.playback_slider.setEnabled(has_time)
+        if has_time:
+            duration = self._playback_max_time - self._playback_start_time
+            self.playback_time_label.setText(f"0.0s / {duration:.1f}s")
+            self.playback_slider.setValue(0)
+        else:
+            self.playback_time_label.setText("0.0s / 0.0s")
+        self._update_playback_button_states()
+
+    def _on_playback_play(self) -> None:
+        if not self._playback_all_times:
+            return
+        if self._playback_state == "stopped":
+            # If a scatter point is selected, start from its time
+            start_offset = self._selected_point_playback_time()
+            self._playback_elapsed = start_offset
+            self._playback_current_wall_start = _time_mod.monotonic()
+            self._apply_playback_at_elapsed(self._playback_elapsed)
+            self._playback_state = "playing"
+            self._playback_timer.start()
+        elif self._playback_state == "paused":
+            self._playback_current_wall_start = _time_mod.monotonic()
+            self._playback_state = "playing"
+            self._playback_timer.start()
+        self._update_playback_button_states()
+
+    def _on_playback_pause(self) -> None:
+        if self._playback_state == "playing":
+            self._playback_timer.stop()
+            wall_delta = _time_mod.monotonic() - self._playback_current_wall_start
+            self._playback_elapsed += wall_delta * self._playback_speed
+            self._playback_state = "paused"
+            self._update_playback_button_states()
+
+    def _on_playback_stop(self) -> None:
+        self._playback_timer.stop()
+        self._playback_state = "stopped"
+        self._playback_elapsed = 0.0
+        self._speed_index = 0
+        self._playback_speed = self._speed_steps[0]
+        self.btn_speed.setText("1x")
+        self.playback_slider.blockSignals(True)
+        self.playback_slider.setValue(0)
+        self.playback_slider.blockSignals(False)
+        duration = self._playback_max_time - self._playback_start_time
+        self.playback_time_label.setText(f"0.0s / {duration:.1f}s")
+        # Restore full scatter data
+        self._refresh_point_styles()
+        self._update_playback_button_states()
+
+    def _on_playback_speed_toggle(self) -> None:
+        # Snapshot the current elapsed time so the speed change is seamless
+        if self._playback_state == "playing":
+            wall_delta = _time_mod.monotonic() - self._playback_current_wall_start
+            self._playback_elapsed += wall_delta * self._playback_speed
+            self._playback_current_wall_start = _time_mod.monotonic()
+        self._speed_index = (self._speed_index + 1) % len(self._speed_steps)
+        self._playback_speed = self._speed_steps[self._speed_index]
+        label = f"{int(self._playback_speed)}x" if self._playback_speed == int(self._playback_speed) else f"{self._playback_speed}x"
+        self.btn_speed.setText(label)
+
+    def _playback_tick(self) -> None:
+        wall_delta = _time_mod.monotonic() - self._playback_current_wall_start
+        elapsed = self._playback_elapsed + wall_delta * self._playback_speed
+        duration = self._playback_max_time - self._playback_start_time
+        if elapsed >= duration:
+            elapsed = duration
+            self._playback_timer.stop()
+            self._playback_elapsed = elapsed
+            self._playback_state = "paused"
+            self._update_playback_button_states()
+        self._apply_playback_at_elapsed(elapsed)
+
+    def _apply_playback_at_elapsed(self, elapsed: float) -> None:
+        """Show only scatter points whose time <= start_time + elapsed."""
+        cutoff = self._playback_start_time + elapsed
+        duration = self._playback_max_time - self._playback_start_time
+
+        # Update slider without re-entrancy
+        self.playback_slider.blockSignals(True)
+        if duration > 0:
+            self.playback_slider.setValue(int(elapsed / duration * 1000))
+        else:
+            self.playback_slider.setValue(1000)
+        self.playback_slider.blockSignals(False)
+        self.playback_time_label.setText(f"{elapsed:.1f}s / {duration:.1f}s")
+
+        # Filter each log scatter series to show only points at or before cutoff
+        for series in self._point_sets:
+            series_id = str(series.get("series_id", ""))
+            if not series_id.startswith("log::"):
+                continue
+            item = self.dynamic_scatter_items.get(series_id)
+            if item is None:
+                continue
+            if not self._is_series_visible(series_id):
+                continue
+            time_values = self._playback_series_time_data.get(series_id)
+            if not time_values:
+                continue
+            rpm_all = series.get("rpm", [])
+            ve_all = series.get("ve", [])
+            rpm_visible = []
+            ve_visible = []
+            for i, t in enumerate(time_values):
+                if t <= cutoff and i < len(rpm_all) and i < len(ve_all):
+                    rpm_visible.append(rpm_all[i])
+                    ve_visible.append(ve_all[i])
+            item.setData(x=rpm_visible, y=ve_visible)
+
+        # Show leading-edge marker on the most recent point
+        self._show_playback_leading_edge(cutoff)
+
+    def _show_playback_leading_edge(self, cutoff: float) -> None:
+        """Highlight the most-recently-revealed scatter point and show merged summary."""
+        best_time = -1.0
+        best_rpm: float | None = None
+        best_ve: float | None = None
+
+        # Collect the leading-edge index per series for the merged summary
+        leading_edges: list[tuple[str, dict[str, Any], int, float]] = []  # (series_id, series, index, time)
+
+        for series_id, time_values in self._playback_series_time_data.items():
+            if not self._is_series_visible(series_id):
+                continue
+            series = self._get_series(series_id)
+            if series is None:
+                continue
+            rpm_all = series.get("rpm", [])
+            ve_all = series.get("ve", [])
+            local_best_t = -1.0
+            local_best_i = -1
+            for i, t in enumerate(time_values):
+                if t <= cutoff and t > local_best_t and i < len(rpm_all) and i < len(ve_all):
+                    local_best_t = t
+                    local_best_i = i
+            if local_best_i >= 0:
+                leading_edges.append((series_id, series, local_best_i, local_best_t))
+                if local_best_t > best_time:
+                    best_time = local_best_t
+                    best_rpm = rpm_all[local_best_i]
+                    best_ve = ve_all[local_best_i]
+
+        if best_rpm is not None and best_ve is not None:
+            self.selected_marker.setData([float(best_rpm)], [float(best_ve)])
+            self.selected_marker.show()
+        else:
+            self.selected_marker.setData([], [])
+            self.selected_marker.hide()
+
+        # Build merged point summary
+        if leading_edges:
+            self._set_selected_point_text(self._format_playback_summary(leading_edges, cutoff))
+        else:
+            self._set_selected_point_text("<span style='color:#f0f0f0'>Selected point: none</span>")
+
+    def _format_playback_summary(
+        self,
+        leading_edges: list[tuple[str, dict[str, Any], int, float]],
+        cutoff: float,
+    ) -> str:
+        """Build a merged point summary for all series at their leading-edge indices."""
+        elapsed = cutoff - self._playback_start_time
+        detail_rows: list[tuple[str, str]] = [("Time:", f"{elapsed:.2f}s")]
+        seen_labels: set[str] = set()
+
+        for series_id, series, index, _t in leading_edges:
+            name = str(series.get("name", series_id))
+            y_values = series.get("ve")
+            if isinstance(y_values, list) and 0 <= index < len(y_values):
+                try:
+                    val = float(y_values[index])
+                    val = val if val == val else None
+                except Exception:
+                    val = None
+            else:
+                val = None
+            label = f"{name}:"
+            if label not in seen_labels:
+                detail_rows.append((label, self._format_value(val)))
+                seen_labels.add(label)
+
+            rpm_all = series.get("rpm", [])
+            if 0 <= index < len(rpm_all):
+                rpm_label = "RPM:"
+                if rpm_label not in seen_labels:
+                    detail_rows.append((rpm_label, self._format_value(float(rpm_all[index]))))
+                    seen_labels.add(rpm_label)
+
+            for channel_dict_key in ("extra_channels", "detail_channels"):
+                channels = series.get(channel_dict_key, {})
+                if not isinstance(channels, dict):
+                    continue
+                for ch_name in sorted(channels.keys()):
+                    ch_label = f"{ch_name}:"
+                    if ch_label in seen_labels:
+                        continue
+                    ch_values = channels.get(ch_name)
+                    if isinstance(ch_values, list) and 0 <= index < len(ch_values):
+                        detail_rows.append((ch_label, self._format_value(ch_values[index])))
+                        seen_labels.add(ch_label)
+
+            count_channels = series.get("count_channels", {})
+            if isinstance(count_channels, dict):
+                for ch_name in sorted(count_channels.keys()):
+                    ch_label = f"{ch_name}:"
+                    if ch_label in seen_labels:
+                        continue
+                    ch_values = count_channels.get(ch_name)
+                    if isinstance(ch_values, list) and 0 <= index < len(ch_values):
+                        cnt = ch_values[index]
+                        detail_rows.append((ch_label, str(int(cnt)) if cnt is not None else "n/a"))
+                        seen_labels.add(ch_label)
+
+        rows_html = "".join(
+            f"<tr><td style='padding-right:10px'>{label}</td><td>{value}</td></tr>"
+            for label, value in detail_rows
+        )
+        return (
+            f"<span style='color:#f0f0f0'>"
+            f"<b>Playback Point Summary:</b><br>"
+            f"<table cellpadding='0' cellspacing='2'>{rows_html}</table>"
+            f"</span>"
+        )
+
+    def _selected_point_playback_time(self) -> float:
+        """Return the elapsed offset for the currently selected point, or 0."""
+        if self._selected_point is None:
+            return 0.0
+        series_id, index = self._selected_point
+        time_values = self._playback_series_time_data.get(series_id)
+        if not time_values or index < 0 or index >= len(time_values):
+            return 0.0
+        return max(0.0, float(time_values[index]) - self._playback_start_time)
+
+    def _on_slider_pressed(self) -> None:
+        self._slider_dragging = True
+        if self._playback_state == "playing":
+            self._playback_timer.stop()
+
+    def _on_slider_released(self) -> None:
+        self._slider_dragging = False
+        duration = self._playback_max_time - self._playback_start_time
+        frac = self.playback_slider.value() / 1000.0
+        self._playback_elapsed = frac * duration
+        if self._playback_state == "playing":
+            self._playback_current_wall_start = _time_mod.monotonic()
+            self._playback_timer.start()
+
+    def _on_slider_value_changed(self, value: int) -> None:
+        if not self._slider_dragging:
+            return
+        duration = self._playback_max_time - self._playback_start_time
+        elapsed = (value / 1000.0) * duration
+        self._apply_playback_at_elapsed(elapsed)
+
+    def _is_playback_active(self) -> bool:
+        return self._playback_state in ("playing", "paused")
 
 
 class RowEditorTableWidget(QTableWidget):
@@ -921,7 +1438,6 @@ class RowVisualizationPreferencesDialog(QDialog):
         "table": "Selected Row Data",
         "raw": "Raw VE1",
         "corrected": "EGO Corrected VE",
-        "average": "Predicted VE",
         "afr": "AFR",
         "afr_target": "AFR Target",
         "afr_error": "AFR Error",
@@ -976,6 +1492,28 @@ class RowVisualizationPreferencesDialog(QDialog):
         return updated
 
 
+class IdentifierExpressionLineEdit(QLineEdit):
+    """QLineEdit for expressions: extends the right-click context menu with an 'Insert Identifier' submenu."""
+
+    def __init__(self, get_identifiers: Callable[[], list[str]], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._get_identifiers = get_identifiers
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        insert_menu = menu.addMenu("Insert Identifier")
+        identifiers = sorted(self._get_identifiers())
+        if identifiers:
+            for name in identifiers:
+                action = insert_menu.addAction(name)
+                action.triggered.connect(lambda checked=False, n=name: self.insert(f'"{ n }"'))
+        else:
+            no_action = insert_menu.addAction("(no identifiers available)")
+            no_action.setEnabled(False)
+        menu.exec(event.globalPos())
+
+
 class TableLogChannelPreferencesDialog(QDialog):
     """Per-table preferences with tabbed UI for table options and log channel picks."""
 
@@ -987,6 +1525,12 @@ class TableLogChannelPreferencesDialog(QDialog):
         "#B4DC8C",
         "#DCAAF0",
     ]
+    _BUILT_IN_PLUGINS: dict[str, dict[str, str]] = {
+        "VE Row Best-Fit Suggestion": {
+            "type": "ve_row_best_fit_suggestion",
+            "button_label": "VE Row Best-Fit Suggestion",
+        },
+    }
 
     def __init__(
         self,
@@ -997,10 +1541,11 @@ class TableLogChannelPreferencesDialog(QDialog):
         current_preferences: dict[str, dict[str, dict[str, bool]]],
         current_preferences_path: Path | None = None,
         initial_table_name: str | None = None,
+        favorite_tables: set[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Row Data Preferences")
+        self.setWindowTitle("Preferences")
         self.resize(980, 580)
 
         self._all_table_names = sorted(table_names)
@@ -1011,10 +1556,29 @@ class TableLogChannelPreferencesDialog(QDialog):
         self._log_channel_names = self._combined_identifier_names()
         self._working_preferences = self._normalize_preferences(current_preferences)
         self._point_cloud_preferences = self._normalize_point_cloud_preferences(current_preferences.get("__point_cloud__", {}))
+        self._show_tunerstudio_names = bool(current_preferences.get("__show_tunerstudio_names__", True))
         self._current_preferences_path = current_preferences_path
         self._cancel_requested = False
         self._initial_table_name = initial_table_name if isinstance(initial_table_name, str) else None
         self._active_point_cloud_source: str | None = None
+        saved_favorites = current_preferences.get("__favorite_tables__", [])
+        if isinstance(saved_favorites, list):
+            self._favorite_tables = {str(name) for name in saved_favorites if isinstance(name, str) and str(name).strip()}
+        else:
+            self._favorite_tables = set()
+        if not self._favorite_tables:
+            self._favorite_tables = set(favorite_tables or set())
+        self._show_only_favorited = False
+        # Tracks which table's data is currently displayed in channels_table.
+        # Used by _save_current_table_state so it always saves to the right key
+        # even though _active_table_name() has already advanced to the new selection.
+        self._displayed_table_name: str | None = None
+        # Sort state for the Tables tab identifier table
+        self._channels_sort_col: int = 0
+        self._channels_sort_asc: bool = True
+        # Sort state for the Scatterplot Points tab table
+        self._cloud_sort_col: int = 0
+        self._cloud_sort_asc: bool = True
 
         layout = QVBoxLayout(self)
 
@@ -1030,19 +1594,67 @@ class TableLogChannelPreferencesDialog(QDialog):
         tune_tab_layout = QVBoxLayout(tune_tab)
 
         table_filter_row = QHBoxLayout()
-        self.show_1d_check = QCheckBox("Show 1D tables")
-        self.show_1d_check.setChecked(True)
-        self.show_1d_check.toggled.connect(self._refresh_table_combo)
-        table_filter_row.addWidget(self.show_1d_check)
-        self.show_2d_check = QCheckBox("Show 2D tables")
-        self.show_2d_check.setChecked(True)
-        self.show_2d_check.toggled.connect(self._refresh_table_combo)
-        table_filter_row.addWidget(self.show_2d_check)
+        _toggle_style = (
+            "QPushButton {"
+            "  border: 1px solid palette(mid);"
+            "  border-radius: 4px;"
+            "  padding: 4px 0px;"
+            "  background: transparent;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: palette(button); }"
+            "QPushButton:checked {"
+            "  background-color: #2277CC;"
+            "  border-color: #1a5f99;"
+            "  color: white;"
+            "}"
+            "QPushButton:checked:hover { background-color: #3388DD; }"
+        )
+        _btn_w = 44
+        self.favorite_btn = QPushButton("★")
+        self.favorite_btn.setCheckable(True)
+        self.favorite_btn.setChecked(False)
+        self.favorite_btn.setFixedWidth(_btn_w)
+        self.favorite_btn.setStyleSheet(_toggle_style)
+        self.favorite_btn.setToolTip("Show only favorite tables")
+        self.favorite_btn.toggled.connect(self._on_table_filter_mode_toggled)
+        table_filter_row.addWidget(self.favorite_btn)
+        self.show_1d_btn = QPushButton("1D")
+        self.show_1d_btn.setCheckable(True)
+        self.show_1d_btn.setChecked(True)
+        self.show_1d_btn.setFixedWidth(_btn_w)
+        self.show_1d_btn.setStyleSheet(_toggle_style)
+        self.show_1d_btn.setToolTip("Show 1D tables")
+        self.show_1d_btn.toggled.connect(self._on_table_filter_mode_toggled)
+        table_filter_row.addWidget(self.show_1d_btn)
+        self.show_2d_btn = QPushButton("2D")
+        self.show_2d_btn.setCheckable(True)
+        self.show_2d_btn.setChecked(False)
+        self.show_2d_btn.setFixedWidth(_btn_w)
+        self.show_2d_btn.setStyleSheet(_toggle_style)
+        self.show_2d_btn.setToolTip("Show 2D tables")
+        self.show_2d_btn.toggled.connect(self._on_table_filter_mode_toggled)
+        table_filter_row.addWidget(self.show_2d_btn)
+        self._table_filter_group = QButtonGroup(self)
+        self._table_filter_group.setExclusive(True)
+        self._table_filter_group.addButton(self.favorite_btn)
+        self._table_filter_group.addButton(self.show_1d_btn)
+        self._table_filter_group.addButton(self.show_2d_btn)
+        # Separator between filter buttons and options on the right
+        _sep = QLabel("|")
+        _sep.setStyleSheet("color: palette(mid); margin: 0 4px;")
+        table_filter_row.addWidget(_sep)
+        self.tunerstudio_names_checkbox = QCheckBox("TunerStudio Names")
+        self.tunerstudio_names_checkbox.setChecked(self._show_tunerstudio_names)
+        self.tunerstudio_names_checkbox.setToolTip("Display TunerStudio-defined table names instead of internal key names")
+        table_filter_row.addWidget(self.tunerstudio_names_checkbox)
         table_filter_row.addStretch(1)
-        self.tune_show_only_checked = QCheckBox("Enabled Identifiers Only")
-        self.tune_show_only_checked.setChecked(False)
-        self.tune_show_only_checked.toggled.connect(self._on_tune_filter_toggled)
-        table_filter_row.addWidget(self.tune_show_only_checked)
+        self.advanced_table_button = QPushButton("Advanced")
+        self.advanced_table_button.setToolTip(
+            "Enable or disable advanced features for the selected table."
+        )
+        self.advanced_table_button.clicked.connect(self._show_table_advanced_menu)
+        table_filter_row.addWidget(self.advanced_table_button)
         tune_tab_layout.addLayout(table_filter_row)
 
         table_picker_row = QHBoxLayout()
@@ -1057,24 +1669,28 @@ class TableLogChannelPreferencesDialog(QDialog):
 
         self.channels_table = QTableWidget()
         self.channels_table.setColumnCount(5)
-        self.channels_table.setHorizontalHeaderLabels(["Identifier", "Display in Scatterplot", "Display in Summary", "Color", "Opacity"])
+        self.channels_table.setHorizontalHeaderLabels(["Identifier", "Display in Scatterplot", "Color", "Opacity", "Tolerance"])
         scatter_header = self.channels_table.horizontalHeaderItem(1)
         if scatter_header is not None:
             scatter_header.setToolTip("shows up as a point cloud in the graph")
-        like_data_header = self.channels_table.horizontalHeaderItem(2)
-        if like_data_header is not None:
-            like_data_header.setToolTip("Shows value in upper right hand corner of graph when the point is selected")
-        color_header = self.channels_table.horizontalHeaderItem(3)
+        color_header = self.channels_table.horizontalHeaderItem(2)
         if color_header is not None:
             color_header.setToolTip("Scatterplot point color (only active when Display in Scatterplot is checked)")
-        opacity_header = self.channels_table.horizontalHeaderItem(4)
+        opacity_header = self.channels_table.horizontalHeaderItem(3)
         if opacity_header is not None:
-            opacity_header.setToolTip("Scatterplot point opacity 0–100% (only active when Display in Scatterplot is checked)")
+            opacity_header.setToolTip("Scatterplot point opacity 0-100% (only active when Display in Scatterplot is checked)")
+        map_tol_header = self.channels_table.horizontalHeaderItem(4)
+        if map_tol_header is not None:
+            map_tol_header.setToolTip("Per-identifier MAP band half-width (kPa). 0 = use the auto-calculated global tolerance.")
         self.channels_table.verticalHeader().setVisible(False)
         self.channels_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        _ch_hdr = self.channels_table.horizontalHeader()
+        _ch_hdr.setSortIndicatorShown(True)
+        _ch_hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        _ch_hdr.sectionClicked.connect(self._on_channels_header_clicked)
         tune_tab_layout.addWidget(self.channels_table, 1)
 
-        tabs.addTab(tune_tab, "Tune Tables")
+        tabs.addTab(tune_tab, "Tables")
 
         custom_tab = QWidget()
         custom_tab_layout = QVBoxLayout(custom_tab)
@@ -1093,8 +1709,8 @@ class TableLogChannelPreferencesDialog(QDialog):
 
         expression_row = QHBoxLayout()
         expression_row.addWidget(QLabel("Expression"))
-        self.custom_expression_edit = QLineEdit()
-        self.custom_expression_edit.setPlaceholderText("Use + - * / and up to 5 identifiers, e.g. ((EGO cor1)/100)*VE1")
+        self.custom_expression_edit = IdentifierExpressionLineEdit(self._combined_identifier_names)
+        self.custom_expression_edit.setPlaceholderText('Wrap identifiers in double quotes, e.g. (("EGO cor1")/100)*"VE1"')
         expression_row.addWidget(self.custom_expression_edit, 1)
         custom_layout.addLayout(expression_row)
 
@@ -1123,20 +1739,12 @@ class TableLogChannelPreferencesDialog(QDialog):
         log_tab = QWidget()
         log_tab_layout = QVBoxLayout(log_tab)
         source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("Scatterplot Points Data Log Name:"))
+        source_row.addWidget(QLabel("Identifier:"))
         self.point_cloud_source_combo = QComboBox()
-        self.point_cloud_source_combo.addItems(self._log_channel_names)
+        self.point_cloud_source_combo.addItems(sorted(self._log_channel_names, key=str.lower))
         self.point_cloud_source_combo.currentTextChanged.connect(self._on_point_cloud_source_changed)
         source_row.addWidget(self.point_cloud_source_combo, 1)
         log_tab_layout.addLayout(source_row)
-
-        cloud_filter_row = QHBoxLayout()
-        cloud_filter_row.addStretch(1)
-        self.cloud_show_only_checked = QCheckBox("Enabled Identifiers Only")
-        self.cloud_show_only_checked.setChecked(False)
-        self.cloud_show_only_checked.toggled.connect(self._on_cloud_filter_toggled)
-        cloud_filter_row.addWidget(self.cloud_show_only_checked)
-        log_tab_layout.addLayout(cloud_filter_row)
 
         self.point_cloud_details_table = QTableWidget()
         self.point_cloud_details_table.setColumnCount(2)
@@ -1149,10 +1757,79 @@ class TableLogChannelPreferencesDialog(QDialog):
             detail_header.setToolTip("Shows value in upper right hand corner of graph when the point is selected")
         self.point_cloud_details_table.verticalHeader().setVisible(False)
         self.point_cloud_details_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        _cl_hdr = self.point_cloud_details_table.horizontalHeader()
+        _cl_hdr.setSortIndicatorShown(True)
+        _cl_hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        _cl_hdr.sectionClicked.connect(self._on_cloud_header_clicked)
         log_tab_layout.addWidget(self.point_cloud_details_table, 1)
 
         tabs.addTab(log_tab, "Scatterplot Points")
+
+        # ── Advanced tab ────────────────────────────────────────────────────
+        advanced_tab = QWidget()
+        advanced_tab_layout = QVBoxLayout(advanced_tab)
+
+        adv_desc = QLabel(
+            "Configure advanced analysis features that use log data together with tune tables."
+        )
+        adv_desc.setWordWrap(True)
+        advanced_tab_layout.addWidget(adv_desc)
+
+        feature_row = QHBoxLayout()
+        feature_row.addWidget(QLabel("Feature:"))
+        self.advanced_feature_combo = QComboBox()
+        self.advanced_feature_combo.addItems(["AFR Prediction"])
+        feature_row.addWidget(self.advanced_feature_combo, 1)
+        advanced_tab_layout.addLayout(feature_row)
+
+        self.advanced_stack = QStackedWidget()
+
+        # ── AFR Prediction pane ──────────────────────────────────────────────
+        afr_pred_widget = QWidget()
+        afr_pred_layout = QVBoxLayout(afr_pred_widget)
+
+        afr_pred_group = QGroupBox("AFR Prediction")
+        afr_pred_group_layout = QFormLayout(afr_pred_group)
+
+        afr_pred_desc = QLabel(
+            "Predicts the expected AFR at each VE table cell using a local linear "
+            "regression of logged data. The prediction changes smoothly as you "
+            "edit VE values, giving a real-world usable tuning reference."
+        )
+        afr_pred_desc.setWordWrap(True)
+        afr_pred_group_layout.addRow(afr_pred_desc)
+
+        afr_pred_help_btn = QPushButton("?")
+        afr_pred_help_btn.setFixedSize(24, 24)
+        afr_pred_help_btn.setToolTip("How AFR Prediction works")
+        afr_pred_help_btn.clicked.connect(self._show_afr_prediction_help)
+        help_row = QHBoxLayout()
+        help_row.addStretch(1)
+        help_row.addWidget(afr_pred_help_btn)
+        afr_pred_group_layout.addRow(help_row)
+
+        self.afr_pred_ve_actual_combo = QComboBox()
+        self.afr_pred_ve_actual_combo.addItems(self._log_channel_names)
+        afr_pred_group_layout.addRow(QLabel("VE Actual Identifier:"), self.afr_pred_ve_actual_combo)
+
+        self.afr_pred_afr_combo = QComboBox()
+        self.afr_pred_afr_combo.addItems(self._log_channel_names)
+        afr_pred_group_layout.addRow(QLabel("AFR Identifier:"), self.afr_pred_afr_combo)
+
+        afr_pred_layout.addWidget(afr_pred_group)
+        afr_pred_layout.addStretch(1)
+        self.advanced_stack.addWidget(afr_pred_widget)
+
+        self.advanced_feature_combo.currentIndexChanged.connect(self.advanced_stack.setCurrentIndex)
+        advanced_tab_layout.addWidget(self.advanced_stack)
+        advanced_tab_layout.addStretch(1)
+        tabs.addTab(advanced_tab, "Advanced")
+
+        # Populate Advanced tab from saved preferences
+        self._apply_advanced_preferences(current_preferences.get("__advanced__", {}))
+
         layout.addWidget(tabs, 1)
+        self.tabs = tabs
 
         button_row = QHBoxLayout()
         save_file_button = QPushButton("Save Preferences As...")
@@ -1179,34 +1856,143 @@ class TableLogChannelPreferencesDialog(QDialog):
             self._populate_point_cloud_targets(self._active_point_cloud_source)
         self._refresh_custom_identifier_table()
 
+    def select_tune_tables_tab(self, table_name: str | None = None) -> None:
+        """Switch to the Tables tab and optionally pre-select a table."""
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Tables":
+                self.tabs.setCurrentIndex(i)
+                break
+        if table_name is not None:
+            index = self.table_combo.findData(table_name)
+            if index >= 0:
+                self.table_combo.setCurrentIndex(index)
+
+    def select_scatterplot_tab(self, identifier: str | None = None) -> None:
+        """Switch to the Scatterplot Points tab and optionally pre-select an identifier."""
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Scatterplot Points":
+                self.tabs.setCurrentIndex(i)
+                break
+        if identifier is not None and self.point_cloud_source_combo.findText(identifier) >= 0:
+            self.point_cloud_source_combo.setCurrentText(identifier)
+
+    def _apply_advanced_preferences(self, adv: Any) -> None:
+        """Populate Advanced tab widgets from a saved preferences dict."""
+        if not isinstance(adv, dict):
+            return
+        afr_cfg = adv.get("afr_prediction", {})
+        if not isinstance(afr_cfg, dict):
+            return
+        ve_id = str(afr_cfg.get("ve_actual_identifier", ""))
+        if ve_id and self.afr_pred_ve_actual_combo.findText(ve_id) >= 0:
+            self.afr_pred_ve_actual_combo.setCurrentText(ve_id)
+        afr_id = str(afr_cfg.get("afr_identifier", ""))
+        if afr_id and self.afr_pred_afr_combo.findText(afr_id) >= 0:
+            self.afr_pred_afr_combo.setCurrentText(afr_id)
+
+    def _advanced_preferences(self) -> dict[str, Any]:
+        """Return current state of the Advanced tab as a serialisable dict."""
+        return {
+            "afr_prediction": {
+                "ve_actual_identifier": self.afr_pred_ve_actual_combo.currentText(),
+                "afr_identifier": self.afr_pred_afr_combo.currentText(),
+            },
+        }
+
+    def _show_afr_prediction_help(self) -> None:
+        """Show a detailed explanation of how AFR Prediction works."""
+        text = (
+            "<h3>AFR Prediction</h3>"
+            "<p>AFR Prediction estimates the Air/Fuel Ratio your engine would "
+            "produce at a given VE table value, based on your logged data.</p>"
+            "<h4>Method — Local Linear Regression</h4>"
+            "<p>For each RPM column in the selected table row the algorithm:</p>"
+            "<ol>"
+            "<li><b>Collects</b> all log data points in the current MAP band "
+            "whose RPM is within &plusmn;150 RPM of the column's RPM value — "
+            "regardless of the current VE cell value.</li>"
+            "<li><b>Fits a best-fit line</b> (linear regression) through those "
+            "points using VE Actual on the X-axis and AFR on the Y-axis.</li>"
+            "<li><b>Evaluates</b> the best-fit line at the current table VE "
+            "value to produce the predicted AFR.</li>"
+            "</ol>"
+            "<h4>Why This Approach?</h4>"
+            "<p>By fitting a trend line through <i>all</i> the nearby data "
+            "instead of only using points that exactly match the current VE "
+            "value, the prediction:</p>"
+            "<ul>"
+            "<li>Changes <b>smoothly and predictably</b> as you adjust VE — "
+            "small VE changes produce proportionally small AFR changes.</li>"
+            "<li>Uses <b>all available data</b> in the RPM neighbourhood, so "
+            "noisy individual readings are averaged out.</li>"
+            "<li>Gives a <b>real-world usable</b> reference for choosing a VE "
+            "value that achieves your target AFR.</li>"
+            "</ul>"
+            "<h4>Fallback</h4>"
+            "<p>If fewer than 3 data points are available near an RPM column "
+            "(not enough for a reliable trend line), the simple average AFR of "
+            "the available points is used instead.</p>"
+        )
+        msg = QMessageBox(self)
+        msg.setWindowTitle("AFR Prediction — How It Works")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(text)
+        msg.exec()
+
     def _on_cancel_clicked(self) -> None:
         self._cancel_requested = True
 
     def _on_scatter_checkbox_changed(self, row: int, checked: bool) -> None:
         """Enable/disable color+opacity controls and refresh filter visibility."""
         enabled = bool(checked)
-        color_btn = self.channels_table.cellWidget(row, 3)
-        opacity_spin = self.channels_table.cellWidget(row, 4)
+        color_btn = self.channels_table.cellWidget(row, 2)
+        opacity_spin = self.channels_table.cellWidget(row, 3)
         if color_btn is not None:
             color_btn.setEnabled(enabled)
         if opacity_spin is not None:
             opacity_spin.setEnabled(enabled)
-        if self.tune_show_only_checked.isChecked():
-            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
-            self.channels_table.setRowHidden(row, not (enabled or selected_on))
 
-    def _on_selected_checkbox_changed(self, row: int, checked: bool) -> None:
-        """Refresh tune-table row visibility when summary checkbox changes."""
-        _ = checked
-        if self.tune_show_only_checked.isChecked():
-            scatter_on = self._table_checkbox_checked(self.channels_table, row, 1)
-            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
-            self.channels_table.setRowHidden(row, not (scatter_on or selected_on))
+    def _on_channels_header_clicked(self, col: int) -> None:
+        """Sort the Tables-tab identifier table by the clicked column."""
+        if col == 0:
+            if self._channels_sort_col == 0:
+                self._channels_sort_asc = not self._channels_sort_asc
+            else:
+                self._channels_sort_col = 0
+                self._channels_sort_asc = True
+        elif col == 1:
+            self._channels_sort_col = 1
+        else:
+            return
+        self._save_current_table_state()
+        table_name = self._displayed_table_name
+        if table_name:
+            self._populate_channels_for_table(table_name)
 
-    def _on_cloud_checkbox_changed(self, row: int, checked: bool) -> None:
-        """Refresh scatterplot-points row visibility when checkbox changes."""
-        if self.cloud_show_only_checked.isChecked():
-            self.point_cloud_details_table.setRowHidden(row, not bool(checked))
+    def _on_cloud_header_clicked(self, col: int) -> None:
+        """Sort the Scatterplot Points table by the clicked column."""
+        if col == 0:
+            if self._cloud_sort_col == 0:
+                self._cloud_sort_asc = not self._cloud_sort_asc
+            else:
+                self._cloud_sort_col = 0
+                self._cloud_sort_asc = True
+        elif col == 1:
+            self._cloud_sort_col = 1
+        else:
+            return
+        source_name = self.point_cloud_source_combo.currentText()
+        self._save_point_cloud_state(source_name)
+        if source_name:
+            self._populate_point_cloud_targets(source_name)
+
+    def _on_table_filter_mode_toggled(self, checked: bool) -> None:
+        """Handle exclusive filter mode changes for the Tables tab."""
+        if not checked:
+            return
+        self._show_only_favorited = self.favorite_btn.isChecked()
+        self._refresh_table_combo()
 
     def _make_centered_checkbox(self, checked: bool, on_changed: Callable[[bool], None] | None = None) -> QWidget:
         """Create a truly centered checkbox cell widget for QTableWidget."""
@@ -1232,25 +2018,12 @@ class TableLogChannelPreferencesDialog(QDialog):
             return box.isChecked()
         return False
 
-    def _on_tune_filter_toggled(self, checked: bool) -> None:
-        """Show or hide rows based on whether any checkbox is set."""
-        for row in range(self.channels_table.rowCount()):
-            scatter_on = self._table_checkbox_checked(self.channels_table, row, 1)
-            selected_on = self._table_checkbox_checked(self.channels_table, row, 2)
-            self.channels_table.setRowHidden(row, checked and not (scatter_on or selected_on))
-
-    def _on_cloud_filter_toggled(self, checked: bool) -> None:
-        """Show or hide rows in the Scatterplot Points table based on checkbox state."""
-        for row in range(self.point_cloud_details_table.rowCount()):
-            is_checked = self._table_checkbox_checked(self.point_cloud_details_table, row, 1)
-            self.point_cloud_details_table.setRowHidden(row, checked and not is_checked)
-
     def _make_color_button(self, hex_color: str) -> QPushButton:
         """Create a color-swatch button that opens a color picker on click."""
         qc = QColor(hex_color)
         lum = 0.299 * qc.red() + 0.587 * qc.green() + 0.114 * qc.blue()
         fg = "#000000" if lum > 128 else "#ffffff"
-        btn = QPushButton(hex_color)
+        btn = QPushButton("")
         btn.setStyleSheet(f"background-color: {hex_color}; color: {fg}; border: 1px solid #666;")
         btn.setProperty("scatter_color", hex_color)
 
@@ -1263,24 +2036,47 @@ class TableLogChannelPreferencesDialog(QDialog):
             lum2 = 0.299 * chosen.red() + 0.587 * chosen.green() + 0.114 * chosen.blue()
             fg2 = "#000000" if lum2 > 128 else "#ffffff"
             button.setStyleSheet(f"background-color: {new_hex}; color: {fg2}; border: 1px solid #666;")
-            button.setText(new_hex)
             button.setProperty("scatter_color", new_hex)
 
         btn.clicked.connect(_pick_color)
         return btn
 
     def reject(self) -> None:  # type: ignore[override]
-        # Closing the dialog applies changes unless the user explicitly clicked Cancel.
-        if self._cancel_requested:
-            super().reject()
-            return
-        self.accept()
+        # Reject should always discard in-dialog edits unless explicitly accepted.
+        super().reject()
 
     @staticmethod
     def _normalize_preferences(raw: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
+        normalized_plugins: dict[str, dict[str, Any]] = {
+            name: dict(cfg) for name, cfg in TableLogChannelPreferencesDialog._BUILT_IN_PLUGINS.items()
+        }
+        plugins = raw.get("__plugins__")
+        if isinstance(plugins, dict):
+            normalized_plugins.update(
+                {
+                    str(name): dict(cfg)
+                    for name, cfg in plugins.items()
+                    if isinstance(name, str) and isinstance(cfg, dict)
+                }
+            )
+        normalized["__plugins__"] = normalized_plugins
+        table_plugins = raw.get("__table_plugins__")
+        if isinstance(table_plugins, dict):
+            normalized["__table_plugins__"] = {
+                str(table_name): {
+                    str(plugin_name): bool(enabled)
+                    for plugin_name, enabled in plugin_map.items()
+                    if isinstance(plugin_name, str)
+                }
+                for table_name, plugin_map in table_plugins.items()
+                if isinstance(table_name, str) and isinstance(plugin_map, dict)
+            }
+        adv = raw.get("__advanced__")
+        if isinstance(adv, dict):
+            normalized["__advanced__"] = adv
         for table_name, channels in raw.items():
-            if table_name in {"__point_cloud__", "__custom_identifiers__"}:
+            if table_name in {"__point_cloud__", "__custom_identifiers__", "__plugins__", "__table_plugins__", "__advanced__"}:
                 continue
             if not isinstance(channels, dict):
                 continue
@@ -1290,10 +2086,10 @@ class TableLogChannelPreferencesDialog(QDialog):
                     continue
                 normalized[table_name][channel_name] = {
                     "show_in_scatterplot": bool(prefs.get("show_in_scatterplot", False)),
-                    "show_when_point_selected": bool(prefs.get("show_when_point_selected", False)),
                     "scatter_color": str(prefs.get("scatter_color", "")),
                     "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
-                }
+                          "map_tolerance": max(0, min(200, int(prefs.get("map_tolerance", 0)))),
+                     }
         return normalized
 
     @staticmethod
@@ -1324,40 +2120,80 @@ class TableLogChannelPreferencesDialog(QDialog):
         return merged
 
     def _extract_identifiers_from_expression(self, expression: str, candidates: list[str]) -> tuple[list[str], str | None]:
-        expr = expression
+        candidate_set = set(candidates)
         found: list[str] = []
-        by_len = sorted([name for name in candidates if name], key=len, reverse=True)
-        for idx, identifier in enumerate(by_len):
-            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])")
-            if pattern.search(expr):
-                token = f"__id{idx}__"
-                expr = pattern.sub(token, expr)
-                found.append(identifier)
-        scrubbed = re.sub(r"__id\d+__", "", expr)
+        quote_pattern = re.compile(r'"([^"]*)"')
+        for match in quote_pattern.finditer(expression):
+            name = match.group(1)
+            if not name:
+                return [], "Quoted identifier cannot be empty."
+            if name not in candidate_set:
+                return [], f'Unknown identifier: "{name}". All identifiers must be wrapped in double quotes.'
+            found.append(name)
+        scrubbed = quote_pattern.sub("", expression)
         scrubbed = re.sub(r"[0-9eE+\-*/().\s]", "", scrubbed)
         if scrubbed:
-            return [], f"Expression contains unknown identifier content: '{scrubbed}'"
+            return [], f"Expression contains unexpected characters outside of quoted identifiers: '{scrubbed}'."
         return found, None
 
     def _refresh_identifier_lists(self, preserve_source: str | None = None) -> None:
         self._save_current_table_state()
         self._save_point_cloud_state(self._active_point_cloud_source)
         self._log_channel_names = self._combined_identifier_names()
+        self._reconcile_identifier_preferences()
         current_source = preserve_source if preserve_source is not None else self.point_cloud_source_combo.currentText()
         self.point_cloud_source_combo.blockSignals(True)
         self.point_cloud_source_combo.clear()
-        self.point_cloud_source_combo.addItems(self._log_channel_names)
+        self.point_cloud_source_combo.addItems(sorted(self._log_channel_names, key=str.lower))
         if current_source and current_source in self._log_channel_names:
             self.point_cloud_source_combo.setCurrentText(current_source)
         elif self._log_channel_names:
             self.point_cloud_source_combo.setCurrentIndex(0)
         self.point_cloud_source_combo.blockSignals(False)
         self._active_point_cloud_source = self.point_cloud_source_combo.currentText() if self._log_channel_names else None
+        # Keep Advanced tab identifier combos in sync with the current identifier list
+        _adv_ve = self.afr_pred_ve_actual_combo.currentText()
+        _adv_afr = self.afr_pred_afr_combo.currentText()
+        self.afr_pred_ve_actual_combo.blockSignals(True)
+        self.afr_pred_afr_combo.blockSignals(True)
+        self.afr_pred_ve_actual_combo.clear()
+        self.afr_pred_ve_actual_combo.addItems(self._log_channel_names)
+        self.afr_pred_afr_combo.clear()
+        self.afr_pred_afr_combo.addItems(self._log_channel_names)
+        if _adv_ve in self._log_channel_names:
+            self.afr_pred_ve_actual_combo.setCurrentText(_adv_ve)
+        if _adv_afr in self._log_channel_names:
+            self.afr_pred_afr_combo.setCurrentText(_adv_afr)
+        self.afr_pred_ve_actual_combo.blockSignals(False)
+        self.afr_pred_afr_combo.blockSignals(False)
         active = self._active_table_name()
         if active:
             self._populate_channels_for_table(active)
         if self._active_point_cloud_source:
             self._populate_point_cloud_targets(self._active_point_cloud_source)
+
+    def _reconcile_identifier_preferences(self) -> None:
+        valid_names = set(self._log_channel_names)
+
+        for table_name, table_prefs in list(self._working_preferences.items()):
+            if not isinstance(table_prefs, dict):
+                continue
+            self._working_preferences[table_name] = {
+                channel_name: prefs
+                for channel_name, prefs in table_prefs.items()
+                if isinstance(channel_name, str) and channel_name in valid_names and isinstance(prefs, dict)
+            }
+
+        reconciled_point_cloud: dict[str, dict[str, bool]] = {}
+        for source_name, targets in list(self._point_cloud_preferences.items()):
+            if not isinstance(source_name, str) or source_name not in valid_names or not isinstance(targets, dict):
+                continue
+            reconciled_point_cloud[source_name] = {
+                target_name: bool(enabled)
+                for target_name, enabled in targets.items()
+                if isinstance(target_name, str) and target_name in valid_names and target_name != source_name
+            }
+        self._point_cloud_preferences = reconciled_point_cloud
 
     def _refresh_custom_identifier_table(self) -> None:
         names = sorted(self._custom_identifiers.keys())
@@ -1410,9 +2246,6 @@ class TableLogChannelPreferencesDialog(QDialog):
         if len(set(found)) == 0:
             QMessageBox.warning(self, "Custom Identifier", "Expression must reference at least one identifier.")
             return
-        if len(set(found)) > 5:
-            QMessageBox.warning(self, "Custom Identifier", "Expression can reference at most 5 identifiers.")
-            return
         if name in found:
             QMessageBox.warning(self, "Custom Identifier", "Expression cannot directly reference itself.")
             return
@@ -1457,17 +2290,24 @@ class TableLogChannelPreferencesDialog(QDialog):
     def _refresh_table_combo(self) -> None:
         previous = self._active_table_name()
         preferred_initial = self._initial_table_name
-        include_1d = self.show_1d_check.isChecked()
-        include_2d = self.show_2d_check.isChecked()
+        include_1d = self.show_1d_btn.isChecked()
+        include_2d = self.show_2d_btn.isChecked()
+        show_only_favorites = self.favorite_btn.isChecked()
 
         filtered: list[str] = []
         for table_name in self._all_table_names:
-            is_1d = bool(self._table_dimensions.get(table_name, False))
-            if is_1d and not include_1d:
-                continue
-            if (not is_1d) and not include_2d:
-                continue
+            if show_only_favorites:
+                if table_name not in self._favorite_tables:
+                    continue
+            else:
+                is_1d = bool(self._table_dimensions.get(table_name, False))
+                if is_1d and not include_1d:
+                    continue
+                if (not is_1d) and not include_2d:
+                    continue
             filtered.append(table_name)
+
+        filtered.sort(key=lambda t: self._display_name_for_table(t).lower())
 
         self.table_combo.blockSignals(True)
         self.table_combo.clear()
@@ -1505,8 +2345,91 @@ class TableLogChannelPreferencesDialog(QDialog):
     def _display_name_for_table(self, table_name: str) -> str:
         return self._table_display_names.get(table_name, table_name)
 
-    def _save_current_table_state(self) -> None:
+    def _table_plugin_preferences(self, table_name: str | None = None) -> dict[str, bool]:
+        active_table = table_name if table_name is not None else self._active_table_name()
+        if not active_table:
+            return {}
+        table_plugins = self._working_preferences.get("__table_plugins__", {})
+        if not isinstance(table_plugins, dict):
+            return {}
+        plugin_map = table_plugins.get(active_table, {})
+        if not isinstance(plugin_map, dict):
+            return {}
+        return {
+            str(plugin_name): bool(enabled)
+            for plugin_name, enabled in plugin_map.items()
+            if isinstance(plugin_name, str)
+        }
+
+    def _set_table_plugin_enabled(self, plugin_name: str, enabled: bool, table_name: str | None = None) -> None:
+        active_table = table_name if table_name is not None else self._active_table_name()
+        if not active_table:
+            return
+        table_plugins = self._working_preferences.setdefault("__table_plugins__", {})
+        if not isinstance(table_plugins, dict):
+            table_plugins = {}
+            self._working_preferences["__table_plugins__"] = table_plugins
+        plugin_map = table_plugins.setdefault(active_table, {})
+        if not isinstance(plugin_map, dict):
+            plugin_map = {}
+            table_plugins[active_table] = plugin_map
+        plugin_map[str(plugin_name)] = bool(enabled)
+
+    def _update_advanced_button_text(self, table_name: str | None = None) -> None:
+        plugin_map = self._table_plugin_preferences(table_name)
+        enabled_count = sum(1 for enabled in plugin_map.values() if enabled)
+        label = "Advanced" if enabled_count == 0 else f"Advanced ({enabled_count})"
+        self.advanced_table_button.setText(label)
+
+    def _show_table_advanced_menu(self) -> None:
         table_name = self._active_table_name()
+        if not table_name:
+            return
+        plugin_map = self._table_plugin_preferences(table_name)
+        display_name = self._display_name_for_table(table_name)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Advanced Features — {display_name}")
+        dlg.setMinimumWidth(340)
+        outer = QVBoxLayout(dlg)
+        outer.setSpacing(10)
+
+        title_label = QLabel(f"<b>{display_name}</b>")
+        outer.addWidget(title_label)
+
+        group = QGroupBox("Enable / Disable Features")
+        group_layout = QVBoxLayout(group)
+        group_layout.setSpacing(6)
+
+        # AFR Prediction row
+        afr_row = QHBoxLayout()
+        afr_cb = QCheckBox("AFR Prediction")
+        afr_cb.setChecked(bool(plugin_map.get("afr_prediction", False)))
+        afr_cb.setToolTip("Predict AFR from VE and logged data for each table cell")
+        afr_row.addWidget(afr_cb, 1)
+        afr_help_btn = QPushButton("?")
+        afr_help_btn.setFixedWidth(26)
+        afr_help_btn.setToolTip("Learn how AFR Prediction works")
+        afr_help_btn.clicked.connect(self._show_afr_prediction_help)
+        afr_row.addWidget(afr_help_btn)
+        group_layout.addLayout(afr_row)
+
+        outer.addWidget(group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        outer.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._set_table_plugin_enabled("afr_prediction", afr_cb.isChecked(), table_name)
+        self._update_advanced_button_text(table_name)
+
+    def _save_current_table_state(self) -> None:
+        # Use _displayed_table_name so we save the data that is *currently shown*
+        # in channels_table, not the table that the combo has already advanced to.
+        table_name = self._displayed_table_name
         if table_name is None:
             return
 
@@ -1517,27 +2440,42 @@ class TableLogChannelPreferencesDialog(QDialog):
                 continue
             channel_name = channel_item.text()
             show_scatter = self._table_checkbox_checked(self.channels_table, row_index, 1)
-            show_selected = self._table_checkbox_checked(self.channels_table, row_index, 2)
-            color_btn = self.channels_table.cellWidget(row_index, 3)
-            opacity_spin = self.channels_table.cellWidget(row_index, 4)
+            color_btn = self.channels_table.cellWidget(row_index, 2)
+            opacity_spin = self.channels_table.cellWidget(row_index, 3)
+            map_tol_spin = self.channels_table.cellWidget(row_index, 4)
             scatter_color = str(color_btn.property("scatter_color") or "") if color_btn is not None else ""
             scatter_opacity = int(opacity_spin.value()) if opacity_spin is not None else 70
+            map_tolerance = int(map_tol_spin.value()) if map_tol_spin is not None else 0
             table_prefs[channel_name] = {
                 "show_in_scatterplot": show_scatter,
-                "show_when_point_selected": show_selected,
                 "scatter_color": scatter_color,
                 "scatter_opacity": scatter_opacity,
+                "map_tolerance": map_tolerance,
             }
 
     def _populate_channels_for_table(self, table_name: str) -> None:
         table_prefs = self._working_preferences.get(table_name, {})
+        # Record what is now displayed so _save_current_table_state targets the right key.
+        self._displayed_table_name = table_name
         self.log_points_label.setText(f"Data log points for table: {self._display_name_for_table(table_name)}")
+        self._update_advanced_button_text(table_name)
+
+        if self._channels_sort_col == 1:
+            channel_order = sorted(
+                self._log_channel_names,
+                key=lambda n: (not bool(table_prefs.get(n, {}).get("show_in_scatterplot", False)), n.lower()),
+            )
+        else:
+            channel_order = sorted(
+                self._log_channel_names,
+                key=lambda n: n.lower(),
+                reverse=not self._channels_sort_asc,
+            )
+
         self.channels_table.blockSignals(True)
         self.channels_table.clearContents()
-        self.channels_table.setRowCount(len(self._log_channel_names))
-        filter_on = self.tune_show_only_checked.isChecked()
-
-        for row_index, channel_name in enumerate(self._log_channel_names):
+        self.channels_table.setRowCount(len(channel_order))
+        for row_index, channel_name in enumerate(channel_order):
             pref = table_prefs.get(channel_name, {})
             name_item = QTableWidgetItem(channel_name)
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -1550,32 +2488,40 @@ class TableLogChannelPreferencesDialog(QDialog):
             )
             self.channels_table.setCellWidget(row_index, 1, scatter_widget)
 
-            selected_checked = bool(pref.get("show_when_point_selected", False))
-            selected_widget = self._make_centered_checkbox(
-                selected_checked,
-                on_changed=lambda checked, r=row_index: self._on_selected_checkbox_changed(r, checked),
-            )
-            self.channels_table.setCellWidget(row_index, 2, selected_widget)
-
             default_hex = self._DEFAULT_SCATTER_PALETTE[row_index % len(self._DEFAULT_SCATTER_PALETTE)]
             hex_color = str(pref.get("scatter_color", "")) or default_hex
             color_btn = self._make_color_button(hex_color)
             color_btn.setEnabled(scatter_checked)
-            self.channels_table.setCellWidget(row_index, 3, color_btn)
+            self.channels_table.setCellWidget(row_index, 2, color_btn)
 
             opacity_spin = QSpinBox()
             opacity_spin.setRange(0, 100)
             opacity_spin.setSuffix(" %")
             opacity_spin.setValue(max(0, min(100, int(pref.get("scatter_opacity", 70)))))
             opacity_spin.setEnabled(scatter_checked)
-            self.channels_table.setCellWidget(row_index, 4, opacity_spin)
+            self.channels_table.setCellWidget(row_index, 3, opacity_spin)
 
-            if filter_on and not (scatter_checked or selected_checked):
-                self.channels_table.setRowHidden(row_index, True)
+            map_tol_spin = QSpinBox()
+            map_tol_spin.setRange(0, 200)
+            map_tol_spin.setSuffix(" kPa")
+            map_tol_spin.setSpecialValueText("auto")
+            map_tol_spin.setValue(max(0, min(200, int(pref.get("map_tolerance", 0)))))
+            map_tol_spin.setToolTip("MAP band half-width for this identifier (0 = use auto-calculated global tolerance)")
+            self.channels_table.setCellWidget(row_index, 4, map_tol_spin)
 
         self.channels_table.resizeColumnsToContents()
-        self.channels_table.setColumnWidth(3, 90)
-        self.channels_table.setColumnWidth(4, 100)
+        color_header = self.channels_table.horizontalHeaderItem(2)
+        if color_header is not None:
+            color_header_width = self.channels_table.fontMetrics().horizontalAdvance(color_header.text()) + 24
+            self.channels_table.setColumnWidth(2, color_header_width)
+        self.channels_table.setColumnWidth(3, 100)
+        self.channels_table.setColumnWidth(4, 120)
+        _hdr = self.channels_table.horizontalHeader()
+        _hdr.setSortIndicatorShown(True)
+        if self._channels_sort_col == 1:
+            _hdr.setSortIndicator(1, Qt.SortOrder.AscendingOrder)
+        else:
+            _hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder if self._channels_sort_asc else Qt.SortOrder.DescendingOrder)
         self.channels_table.blockSignals(False)
 
     def _on_table_changed(self, index: int) -> None:
@@ -1588,9 +2534,24 @@ class TableLogChannelPreferencesDialog(QDialog):
     def preferences(self) -> dict[str, dict[str, dict[str, bool]]]:
         self._save_current_table_state()
         self._save_point_cloud_state()
+        self._show_tunerstudio_names = self.tunerstudio_names_checkbox.isChecked()
         merged = self._normalize_preferences(self._working_preferences)
         merged["__point_cloud__"] = self._normalize_point_cloud_preferences(self._point_cloud_preferences)
         merged["__custom_identifiers__"] = self._normalize_custom_identifiers(self._custom_identifiers)
+        merged["__show_tunerstudio_names__"] = self._show_tunerstudio_names
+        merged["__favorite_tables__"] = sorted(self._favorite_tables)
+        table_plugins = self._working_preferences.get("__table_plugins__", {})
+        if isinstance(table_plugins, dict):
+            merged["__table_plugins__"] = {
+                str(table_name): {
+                    str(plugin_name): bool(enabled)
+                    for plugin_name, enabled in plugin_map.items()
+                    if isinstance(plugin_name, str)
+                }
+                for table_name, plugin_map in table_plugins.items()
+                if isinstance(table_name, str) and isinstance(plugin_map, dict)
+            }
+        merged["__advanced__"] = self._advanced_preferences()
         return merged
 
     def _save_point_cloud_state(self, source_name: str | None = None) -> None:
@@ -1611,23 +2572,34 @@ class TableLogChannelPreferencesDialog(QDialog):
     def _populate_point_cloud_targets(self, source_name: str) -> None:
         source_prefs = self._point_cloud_preferences.get(source_name, {})
         targets = [name for name in self._log_channel_names if name != source_name]
-        filter_on = self.cloud_show_only_checked.isChecked()
+        if self._cloud_sort_col == 1:
+            display_targets = sorted(
+                targets,
+                key=lambda n: (not bool(source_prefs.get(n, False)), n.lower()),
+            )
+        else:
+            display_targets = sorted(
+                targets,
+                key=lambda n: n.lower(),
+                reverse=not self._cloud_sort_asc,
+            )
         self.point_cloud_details_table.blockSignals(True)
         self.point_cloud_details_table.clearContents()
-        self.point_cloud_details_table.setRowCount(len(targets))
-        for row_index, target_name in enumerate(targets):
+        self.point_cloud_details_table.setRowCount(len(display_targets))
+        for row_index, target_name in enumerate(display_targets):
             name_item = QTableWidgetItem(target_name)
             name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.point_cloud_details_table.setItem(row_index, 0, name_item)
             checked = bool(source_prefs.get(target_name, False))
-            check_widget = self._make_centered_checkbox(
-                checked,
-                on_changed=lambda state, r=row_index: self._on_cloud_checkbox_changed(r, state),
-            )
+            check_widget = self._make_centered_checkbox(checked)
             self.point_cloud_details_table.setCellWidget(row_index, 1, check_widget)
-            if filter_on and not checked:
-                self.point_cloud_details_table.setRowHidden(row_index, True)
         self.point_cloud_details_table.resizeColumnsToContents()
+        _hdr = self.point_cloud_details_table.horizontalHeader()
+        _hdr.setSortIndicatorShown(True)
+        if self._cloud_sort_col == 1:
+            _hdr.setSortIndicator(1, Qt.SortOrder.AscendingOrder)
+        else:
+            _hdr.setSortIndicator(0, Qt.SortOrder.AscendingOrder if self._cloud_sort_asc else Qt.SortOrder.DescendingOrder)
         self.point_cloud_details_table.blockSignals(False)
 
     def _on_point_cloud_source_changed(self, source_name: str) -> None:
@@ -1670,24 +2642,8 @@ class TableLogChannelPreferencesDialog(QDialog):
         if not file_path:
             return
 
-        source_path = Path(file_path)
-        load_path = source_path
-
-        if self._current_preferences_path is not None:
-            try:
-                self._current_preferences_path.parent.mkdir(parents=True, exist_ok=True)
-                self._current_preferences_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-                load_path = self._current_preferences_path
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.critical(
-                    self,
-                    "Load Preferences Error",
-                    f"Could not apply selected file as current preferences:\n{exc}",
-                )
-                return
-
         try:
-            payload = json.loads(load_path.read_text(encoding="utf-8"))
+            payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Load Preferences Error", f"Could not read preferences file:\n{exc}")
             return
@@ -1700,6 +2656,16 @@ class TableLogChannelPreferencesDialog(QDialog):
         self._working_preferences = self._normalize_preferences(loaded_tables)
         self._point_cloud_preferences = self._normalize_point_cloud_preferences(loaded_tables.get("__point_cloud__", {}))
         self._custom_identifiers = self._normalize_custom_identifiers(loaded_tables.get("__custom_identifiers__", {}))
+        self._apply_advanced_preferences(loaded_tables.get("__advanced__", {}))
+        loaded_favorites = loaded_tables.get("__favorite_tables__", [])
+        if isinstance(loaded_favorites, list):
+            self._favorite_tables = {str(name) for name in loaded_favorites if isinstance(name, str) and str(name).strip()}
+        
+        # Apply show_tunerstudio_names setting from loaded preferences to UI
+        loaded_show_names = bool(loaded_tables.get("__show_tunerstudio_names__", True))
+        self._show_tunerstudio_names = loaded_show_names
+        self.tunerstudio_names_checkbox.setChecked(loaded_show_names)
+        
         self._refresh_custom_identifier_table()
         self._refresh_identifier_lists(preserve_source=self._active_point_cloud_source)
         active = self._active_table_name()
@@ -1788,18 +2754,18 @@ class StartupTuneDialog(QDialog):
         layout.addWidget(self.recent_list, 1)
 
         button_row = QHBoxLayout()
-        browse_button = QPushButton("Browse...")
-        browse_button.clicked.connect(self._browse_for_tune)
-        button_row.addWidget(browse_button)
-
+        button_row.setSpacing(12)
         self.open_button = QPushButton("Open")
         self.open_button.clicked.connect(self._open_selected)
         self.open_button.setEnabled(has_recent_tunes)
-        button_row.addWidget(self.open_button)
+        self.open_button.setMinimumHeight(38)
+        button_row.addWidget(self.open_button, 1)
 
-        quit_button = QPushButton("Quit")
-        quit_button.clicked.connect(self.reject)
-        button_row.addWidget(quit_button)
+        browse_button = QPushButton("Browse...")
+        browse_button.clicked.connect(self._browse_for_tune)
+        browse_button.setMinimumHeight(38)
+        button_row.addWidget(browse_button, 1)
+
         layout.addLayout(button_row)
 
     def _update_open_button_state(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
@@ -1847,10 +2813,10 @@ class MainWindow(QMainWindow):
     DEFAULT_WINDOW_DOCK_STATE_KEY = "default_main_window_dock_state_v1"
     OPEN_TUNE_PLACEHOLDER_KEY = "__open_tune_file__"
     ROW_VIZ_SERIES_BY_TABLE_TYPE: dict[str, list[str]] = {
-        "ve": ["table", "average"],
-        "afr": ["table"],
-        "knock": ["table"],
-        "generic": ["table"],
+        "ve": [],
+        "afr": [],
+        "knock": [],
+        "generic": [],
     }
 
     def __init__(self) -> None:
@@ -1882,7 +2848,6 @@ class MainWindow(QMainWindow):
         self._history_is_applying = False
         self.undo_action: QAction | None = None
         self.redo_action: QAction | None = None
-        self.average_line_data: dict[str, Any] | None = None
         self._last_row_viz_dataset_key: tuple[Any, ...] | None = None
         self.loaded_table_snapshots: dict[str, list[list[float]]] = {}
         self.selected_rows_per_table: dict[str, int] = {}  # Track selected row for each table
@@ -1899,6 +2864,7 @@ class MainWindow(QMainWindow):
         self.only_show_favorited_tables = False
         self.show_1d_tables = True
         self.show_2d_tables = True
+        self.show_log_playback = True
         self.show_tunerstudio_names = True
         self.row_viz_preferences: dict[str, dict[str, bool]] = self._default_row_viz_preferences()
         self.table_log_channel_preferences: dict[str, dict[str, dict[str, bool]]] = {}
@@ -1923,13 +2889,13 @@ class MainWindow(QMainWindow):
     def _create_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
 
-        open_tune_action = file_menu.addAction("Open &Tune File...")
+        open_tune_action = file_menu.addAction("Open Tune...")
         open_tune_action.triggered.connect(self._open_tune_file)
 
-        select_working_folder_action = file_menu.addAction("Select &Working Folder...")
-        select_working_folder_action.triggered.connect(self._on_select_working_folder)
+        open_log_action = file_menu.addAction("Open Log...")
+        open_log_action.triggered.connect(self._open_log_file)
 
-        self.recent_tunes_menu = file_menu.addMenu("Recent &Tune Files")
+        self.recent_tunes_menu = file_menu.addMenu("Recent Tunes")
         self._update_recent_tunes_menu()
 
         load_recent_tune_shortcut_action = QAction(self)
@@ -1942,16 +2908,19 @@ class MainWindow(QMainWindow):
         load_matching_log_shortcut_action.triggered.connect(self._on_load_matching_log_shortcut)
         self.addAction(load_matching_log_shortcut_action)
 
+        self.recent_logs_menu = file_menu.addMenu("Recent Logs")
+        self._update_recent_logs_menu()
+
+        file_menu.addSeparator()
+
         self.save_tune_as_action = file_menu.addAction("Save Tune &As...")
         self.save_tune_as_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_tune_as_action.triggered.connect(self._save_tune_as)
         self.save_tune_as_action.setEnabled(False)
 
-        open_log_action = file_menu.addAction("Open &Log File...")
-        open_log_action.triggered.connect(self._open_log_file)
-
-        self.recent_logs_menu = file_menu.addMenu("Recent &Log Files")
-        self._update_recent_logs_menu()
+        file_menu.addSeparator()
+        preferences_action = file_menu.addAction("&Preferences...")
+        preferences_action.triggered.connect(self._open_preferences)
 
         file_menu.addSeparator()
         exit_action = file_menu.addAction("E&xit")
@@ -1968,47 +2937,26 @@ class MainWindow(QMainWindow):
         self.redo_action.triggered.connect(self._trigger_global_redo)
         self.redo_action.setEnabled(False)
 
-        edit_menu.addSeparator()
-        preferences_action = edit_menu.addAction("&Preferences...")
-        preferences_action.triggered.connect(self._open_preferences)
-
         self.view_menu = self.menuBar().addMenu("&View")
-        self.tunerstudio_names_action = self.view_menu.addAction("&TunerStudio Table Names")
-        self.tunerstudio_names_action.setCheckable(True)
-        self.tunerstudio_names_action.setChecked(True)
-        self.tunerstudio_names_action.triggered.connect(self._on_tunerstudio_names_toggled)
 
-        self.only_show_favorited_tables_action = self.view_menu.addAction("&Favorite Tables Only")
-        self.only_show_favorited_tables_action.setCheckable(True)
-        self.only_show_favorited_tables_action.setChecked(self.only_show_favorited_tables)
-        self.only_show_favorited_tables_action.triggered.connect(self._on_only_show_favorited_toggled)
+        self.window_layout_menu = self.view_menu.addMenu("Window Layout")
 
-        self.show_2d_tables_action = self.view_menu.addAction("Show &2D Tables")
-        self.show_2d_tables_action.setCheckable(True)
-        self.show_2d_tables_action.setChecked(self.show_2d_tables)
-        self.show_2d_tables_action.triggered.connect(self._on_show_2d_tables_toggled)
+        save_layout_action = self.window_layout_menu.addAction("Save")
+        save_layout_action.triggered.connect(self._save_default_window_layout)
 
-        self.show_1d_tables_action = self.view_menu.addAction("Show &1D Tables")
-        self.show_1d_tables_action.setCheckable(True)
-        self.show_1d_tables_action.setChecked(self.show_1d_tables)
-        self.show_1d_tables_action.triggered.connect(self._on_show_1d_tables_toggled)
-        # Grey out dimensional filters when showing only favorited tables
-        self.show_2d_tables_action.setEnabled(not self.only_show_favorited_tables)
-        self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
+        load_layout_action = self.window_layout_menu.addAction("Load")
+        load_layout_action.triggered.connect(self._load_default_window_layout)
+
+        reset_layout_action = self.window_layout_menu.addAction("Reset")
+        reset_layout_action.triggered.connect(self._reset_window_layout)
+        self.window_layout_menu.ensurePolished()
+        self.window_layout_menu.setMinimumWidth(self.window_layout_menu.sizeHint().width())
+
+        self.windows_menu = self.view_menu.addMenu("Visible Windows")
 
     def _set_tune_save_actions_enabled(self, enabled: bool) -> None:
         if self.save_tune_as_action is not None:
             self.save_tune_as_action.setEnabled(enabled)
-
-        self.view_menu.addSeparator()
-        save_default_layout_action = self.view_menu.addAction("Save Current Layout As Default")
-        save_default_layout_action.triggered.connect(self._save_default_window_layout)
-
-        load_default_layout_action = self.view_menu.addAction("Load Default Window Layout")
-        load_default_layout_action.triggered.connect(self._load_default_window_layout)
-
-        reset_layout_action = self.view_menu.addAction("Reset Window Layout")
-        reset_layout_action.triggered.connect(self._reset_window_layout)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_dock_layout()
@@ -2118,12 +3066,10 @@ class MainWindow(QMainWindow):
     def _set_row_editor_button_visibility(
         self,
         show_generate: bool,
-        show_apply_predictions: bool,
         show_write: bool,
         show_revert: bool,
     ) -> None:
-        self.generate_average_button.setVisible(show_generate)
-        self.apply_average_to_row_button.setVisible(show_apply_predictions)
+        _ = show_generate
         _ = show_write
         self.revert_row_changes_button.setVisible(show_revert)
 
@@ -2258,7 +3204,7 @@ class MainWindow(QMainWindow):
         baseline_cell_value = float(table.values[row_index][column_index])
         table_state = self.pending_edits_per_table.setdefault(
             table_name,
-            {"rows": {}, "one_d": None, "average_line_data": None},
+            {"rows": {}, "one_d": None},
         )
 
         if table.rows == 1:
@@ -2588,31 +3534,40 @@ class MainWindow(QMainWindow):
 
     def _load_table_filter_preferences(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
-        self.only_show_favorited_tables = bool(settings.value("only_show_favorited_tables", False, type=bool))
-        self.show_1d_tables = bool(settings.value("show_1d_tables", True, type=bool))
-        self.show_2d_tables = bool(settings.value("show_2d_tables", True, type=bool))
+        # Always start with Favorites mode selected on every launch
+        self.only_show_favorited_tables = True
+        self.show_1d_tables = False
+        self.show_2d_tables = False
+        self.show_log_playback = bool(settings.value("show_log_playback", True, type=bool))
+        self._normalize_table_filter_mode()
+
+    def _normalize_table_filter_mode(self) -> None:
+        """Ensure exactly one table filter mode is active."""
+        if self.only_show_favorited_tables:
+            self.show_1d_tables = False
+            self.show_2d_tables = False
+            return
+        if self.show_1d_tables:
+            self.show_2d_tables = False
+            return
+        if self.show_2d_tables:
+            self.show_1d_tables = False
+            return
+        self.show_1d_tables = True
 
     def _save_table_filter_preferences(self) -> None:
         settings = QSettings("GyattOTune", "GyattOTune")
         settings.setValue("only_show_favorited_tables", self.only_show_favorited_tables)
         settings.setValue("show_1d_tables", self.show_1d_tables)
         settings.setValue("show_2d_tables", self.show_2d_tables)
+        settings.setValue("show_log_playback", self.show_log_playback)
 
     def _default_row_viz_preferences(self) -> dict[str, dict[str, bool]]:
         return {
-            "ve": {
-                "table": True,
-                "average": True,
-            },
-            "afr": {
-                "table": True,
-            },
-            "knock": {
-                "table": True,
-            },
-            "generic": {
-                "table": True,
-            },
+            "ve": {},
+            "afr": {},
+            "knock": {},
+            "generic": {},
         }
 
     def _load_row_viz_preferences(self) -> None:
@@ -2668,6 +3623,28 @@ class MainWindow(QMainWindow):
                             target_name: bool(enabled) for target_name, enabled in targets.items()
                         }
                 continue
+            if table_name == "__favorite_tables__":
+                if isinstance(channels, list):
+                    normalized[table_name] = [
+                        str(name) for name in channels if isinstance(name, str) and str(name).strip()
+                    ]
+                continue
+            if table_name == "__advanced__":
+                if isinstance(channels, dict):
+                    normalized[table_name] = channels
+                continue
+            if table_name == "__table_plugins__":
+                if isinstance(channels, dict):
+                    normalized[table_name] = {
+                        str(saved_table_name): {
+                            str(plugin_name): bool(enabled)
+                            for plugin_name, enabled in plugin_map.items()
+                            if isinstance(plugin_name, str)
+                        }
+                        for saved_table_name, plugin_map in channels.items()
+                        if isinstance(saved_table_name, str) and isinstance(plugin_map, dict)
+                    }
+                continue
             if not isinstance(channels, dict):
                 continue
             normalized[table_name] = {}
@@ -2676,9 +3653,9 @@ class MainWindow(QMainWindow):
                     continue
                 normalized[table_name][channel_name] = {
                     "show_in_scatterplot": bool(prefs.get("show_in_scatterplot", False)),
-                    "show_when_point_selected": bool(prefs.get("show_when_point_selected", False)),
                     "scatter_color": str(prefs.get("scatter_color", "")),
                     "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                    "map_tolerance": max(0, min(200, int(prefs.get("map_tolerance", 0)))),
                 }
         return normalized
 
@@ -2695,15 +3672,26 @@ class MainWindow(QMainWindow):
                 self.table_log_channel_preferences = {}
                 return
             self.table_log_channel_preferences = self._normalize_table_log_channel_preferences(tables)
+            # Load the show_tunerstudio_names setting from preferences
+            if "__show_tunerstudio_names__" in tables:
+                self.show_tunerstudio_names = bool(tables.get("__show_tunerstudio_names__", True))
+            loaded_favorites = tables.get("__favorite_tables__", [])
+            if isinstance(loaded_favorites, list) and loaded_favorites:
+                self.favorite_tables = {str(name) for name in loaded_favorites if isinstance(name, str) and str(name).strip()}
+                self._save_favorites()
         except Exception:
             self.table_log_channel_preferences = {}
 
     def _save_table_log_channel_preferences(self) -> None:
         path = self._table_log_preferences_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        tables_to_save = self._normalize_table_log_channel_preferences(self.table_log_channel_preferences)
+        # Ensure __show_tunerstudio_names__ is included in the saved preferences
+        tables_to_save["__show_tunerstudio_names__"] = self.show_tunerstudio_names
+        tables_to_save["__favorite_tables__"] = sorted(self.favorite_tables)
         payload = {
             "version": 1,
-            "tables": self._normalize_table_log_channel_preferences(self.table_log_channel_preferences),
+            "tables": tables_to_save,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -2743,18 +3731,28 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _tokenize_identifier_expression(expression: str, candidate_names: list[str]) -> tuple[str, dict[str, str], str | None]:
-        transformed = str(expression)
+        candidate_set = set(n for n in candidate_names if isinstance(n, str) and n)
         token_map: dict[str, str] = {}
-        ordered_names = sorted([name for name in candidate_names if isinstance(name, str) and name], key=len, reverse=True)
-        for idx, name in enumerate(ordered_names):
-            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
-            token = f"__id{idx}__"
-            if pattern.search(transformed):
-                transformed = pattern.sub(token, transformed)
-                token_map[token] = name
+        name_to_token: dict[str, str] = {}
+        idx = 0
 
+        def _replace(m: re.Match) -> str:
+            nonlocal idx
+            name = m.group(1)
+            if name not in name_to_token:
+                token = f"__id{idx}__"
+                idx += 1
+                name_to_token[name] = token
+                token_map[token] = name
+            return name_to_token[name]
+
+        quote_pattern = re.compile(r'"([^"]*)"')
+        transformed = quote_pattern.sub(_replace, expression)
+        for name in name_to_token:
+            if name not in candidate_set:
+                return transformed, token_map, f"Unknown identifier: '{name}'"
         scrubbed = transformed
-        for token in token_map.keys():
+        for token in token_map:
             scrubbed = scrubbed.replace(token, "")
         scrubbed = re.sub(r"[0-9eE+\-*/().\s]", "", scrubbed)
         if scrubbed:
@@ -2792,7 +3790,7 @@ class MainWindow(QMainWindow):
         transformed, token_map, error = self._tokenize_identifier_expression(expression, candidates)
         if error is not None:
             return None
-        if len(set(token_map.values())) == 0 or len(set(token_map.values())) > 5:
+        if len(set(token_map.values())) == 0:
             return None
 
         env: dict[str, Any] = {}
@@ -2882,7 +3880,7 @@ class MainWindow(QMainWindow):
         }
         available: list[str] = []
         for series_id in allowed:
-            if series_id == "table" or series_id in existing:
+            if series_id in existing:
                 available.append(series_id)
         return available
 
@@ -2978,6 +3976,13 @@ class MainWindow(QMainWindow):
                         map_mask=map_mask,
                         filtered_rpm_values=filtered_rpm_values,
                         filtered_map_values=filtered_map_values,
+                    )
+                    self._apply_afr_prediction_to_payload(
+                        table_name=table_name,
+                        point_sets=point_sets,
+                        table_rpm_values=[float(v) for v in x_values],
+                        map_mask=map_mask,
+                        filtered_rpm_values=filtered_rpm_values,
                     )
                     stats += f"\nLog points: {len(filtered_rpm_values)}"
 
@@ -3210,30 +4215,29 @@ class MainWindow(QMainWindow):
         if not self.tune_data:
             return
 
-        self.show_tunerstudio_names = self.tunerstudio_names_action.isChecked()
         current_item = self.table_list.currentItem()
         current_table_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
 
         self.table_list.clear()
         all_items = []
-        for table_name in sorted(self.tune_data.tables.keys()):
+        for table_name in self.tune_data.tables.keys():
             # Apply filters
             if self.only_show_favorited_tables:
-                # Only show favorited tables (ignore 1D filter)
                 if table_name not in self.favorite_tables:
                     continue
             else:
-                # Apply dimensional filters when not in favorites-only mode
                 is_1d = self._is_1d_table(table_name)
                 if is_1d and not self.show_1d_tables:
                     continue
                 if (not is_1d) and not self.show_2d_tables:
                     continue
-            
+
             display_name = self._get_tunerstudio_name(table_name) if self.show_tunerstudio_names else table_name
             if table_name in self.favorite_tables and not self.only_show_favorited_tables:
                 display_name = f"★ {display_name}"
             all_items.append((table_name, display_name))
+
+        all_items.sort(key=lambda x: x[1].lstrip("★ ").lower())
 
         if all_items:
             selected_idx = 0
@@ -3261,12 +4265,10 @@ class MainWindow(QMainWindow):
         else:
             if self.only_show_favorited_tables:
                 self.table_list.addItem("No favorite tables")
-            elif not self.show_1d_tables and not self.show_2d_tables:
-                self.table_list.addItem("All table types are hidden")
-            elif not self.show_1d_tables:
-                self.table_list.addItem("No 2D tables found")
-            elif not self.show_2d_tables:
+            elif self.show_1d_tables:
                 self.table_list.addItem("No 1D tables found")
+            elif self.show_2d_tables:
+                self.table_list.addItem("No 2D tables found")
             else:
                 self.table_list.addItem("No tables found")
 
@@ -3286,32 +4288,61 @@ class MainWindow(QMainWindow):
 
         self.table_list.setCurrentRow(target_idx)
 
-    def _on_tunerstudio_names_toggled(self) -> None:
-        """Handle View menu TunerStudio names toggle."""
-        self._update_table_display()
+    def _sync_table_filter_buttons(self) -> None:
+        """Keep table filter button states in sync."""
+        self._normalize_table_filter_mode()
+        self.favorite_tables_button.blockSignals(True)
+        self.favorite_tables_button.setChecked(self.only_show_favorited_tables)
+        self.favorite_tables_button.blockSignals(False)
 
-    def _on_only_show_favorited_toggled(self) -> None:
+        self.show_1d_tables_button.blockSignals(True)
+        self.show_1d_tables_button.setChecked(self.show_1d_tables)
+        self.show_1d_tables_button.blockSignals(False)
+
+        self.show_2d_tables_button.blockSignals(True)
+        self.show_2d_tables_button.setChecked(self.show_2d_tables)
+        self.show_2d_tables_button.blockSignals(False)
+
+    def _on_only_show_favorited_toggled(self, checked: bool) -> None:
         """Handle 'Favorite Tables Only' toggle."""
-        self.only_show_favorited_tables = self.only_show_favorited_tables_action.isChecked()
-        # Grey out table-type filters when showing only favorited tables
-        self.show_2d_tables_action.setEnabled(not self.only_show_favorited_tables)
-        self.show_1d_tables_action.setEnabled(not self.only_show_favorited_tables)
+        if not checked:
+            return
+        self.only_show_favorited_tables = True
+        self.show_1d_tables = False
+        self.show_2d_tables = False
         self._save_table_filter_preferences()
         self._update_table_display()
 
-    def _on_show_2d_tables_toggled(self) -> None:
+    def _on_show_2d_tables_toggled(self, checked: bool) -> None:
         """Handle 'Show 2D Tables' toggle."""
-        self.show_2d_tables = self.show_2d_tables_action.isChecked()
+        if not checked:
+            return
+        self.only_show_favorited_tables = False
+        self.show_1d_tables = False
+        self.show_2d_tables = True
         self._save_table_filter_preferences()
         self._update_table_display()
 
-    def _on_show_1d_tables_toggled(self) -> None:
+    def _on_show_1d_tables_toggled(self, checked: bool) -> None:
         """Handle 'Show 1D Tables' toggle."""
-        self.show_1d_tables = self.show_1d_tables_action.isChecked()
+        if not checked:
+            return
+        self.only_show_favorited_tables = False
+        self.show_1d_tables = True
+        self.show_2d_tables = False
         self._save_table_filter_preferences()
         self._update_table_display()
 
-    def _open_preferences(self) -> None:
+    def _on_show_log_playback_toggled(self, enabled: bool | None = None) -> None:
+        """Handle 'Log Playback' toggle."""
+        if enabled is None:
+            enabled = not self.show_log_playback
+        self.show_log_playback = bool(enabled)
+        if hasattr(self, "table_row_panel") and self.table_row_panel is not None:
+            self.table_row_panel.set_playback_controls_enabled(self.show_log_playback)
+        self._save_table_filter_preferences()
+
+    def _open_preferences(self, initial_table_name: str | None = None, initial_scatter_identifier: str | None = None) -> None:
         if self.tune_data is None or not self.tune_data.tables:
             QMessageBox.information(self, "Preferences", "Load a tune file first to configure per-table preferences.")
             return
@@ -3333,30 +4364,62 @@ class MainWindow(QMainWindow):
             for table_name, table in self.tune_data.tables.items()
         }
         log_channel_names = self._all_identifier_names_for_preferences()
-        initial_table_name = self.current_table.name if self.current_table is not None else "veTable1"
+        if initial_table_name is None:
+            initial_table_name = self.current_table.name if self.current_table is not None else "veTable1"
+        # Add current show_tunerstudio_names setting to preferences dict for dialog
+        prefs_with_tunerstudio = dict(self.table_log_channel_preferences)
+        prefs_with_tunerstudio["__show_tunerstudio_names__"] = self.show_tunerstudio_names
+        prefs_with_tunerstudio["__favorite_tables__"] = sorted(self.favorite_tables)
         dialog = TableLogChannelPreferencesDialog(
+            favorite_tables=self.favorite_tables,
             table_names=table_names,
             table_dimensions=table_dimensions,
             table_display_names=table_display_names,
             log_channel_names=log_channel_names,
-            current_preferences=self.table_log_channel_preferences,
+            current_preferences=prefs_with_tunerstudio,
             current_preferences_path=self._table_log_preferences_path(),
             initial_table_name=initial_table_name,
             parent=self,
         )
+        # Sync the dialog's Tables tab filter buttons to the current main-window state.
+        if self.only_show_favorited_tables:
+            dialog.favorite_btn.setChecked(True)
+        elif self.show_2d_tables:
+            dialog.show_2d_btn.setChecked(True)
+        else:
+            dialog.show_1d_btn.setChecked(True)
+
+        if initial_scatter_identifier is not None:
+            dialog.select_scatterplot_tab(initial_scatter_identifier)
+        else:
+            dialog.select_tune_tables_tab(initial_table_name)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("Cancelled row data preferences changes", 3000)
+            # Reload preferences from disk to discard any in-memory changes
+            self._load_table_log_channel_preferences()
             return
 
         # Apply preferences whenever the dialog is closed, except explicit Cancel.
         self.table_log_channel_preferences = dialog.preferences()
+        self.show_tunerstudio_names = dialog._show_tunerstudio_names
+        loaded_favorites = self.table_log_channel_preferences.get("__favorite_tables__", [])
+        if isinstance(loaded_favorites, list):
+            self.favorite_tables = {str(name) for name in loaded_favorites if isinstance(name, str) and str(name).strip()}
+            self._save_favorites()
         try:
             self._save_table_log_channel_preferences()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Preferences", f"Preferences updated in memory, but could not save to disk:\n{exc}")
 
         self.statusBar().showMessage("Saved row data preferences", 3000)
+        self._update_table_display()
         self._update_table_grid_row_visualization()
+
+    def _on_table_list_item_double_clicked(self, item: QListWidgetItem) -> None:
+        """Add to favorites when a table item is double-clicked (does not remove if already favorited)."""
+        table_name = item.data(Qt.ItemDataRole.UserRole)
+        if table_name and table_name not in self.favorite_tables:
+            self._toggle_favorite(table_name)
 
     def _show_table_context_menu(self, position) -> None:
         """Show context menu for table list items."""
@@ -3378,6 +4441,10 @@ class MainWindow(QMainWindow):
             favorite_action = menu.addAction("Add to Favorites")
             favorite_action.triggered.connect(lambda: self._toggle_favorite(table_name))
 
+        menu.addSeparator()
+        prefs_action = menu.addAction("Table Preferences...")
+        prefs_action.triggered.connect(lambda: self._open_preferences(initial_table_name=table_name))
+
         menu.exec(list_widget.mapToGlobal(position))
 
     def _toggle_favorite(self, table_name: str) -> None:
@@ -3387,6 +4454,11 @@ class MainWindow(QMainWindow):
         else:
             self.favorite_tables.add(table_name)
         self._save_favorites()
+        self.table_log_channel_preferences["__favorite_tables__"] = sorted(self.favorite_tables)
+        try:
+            self._save_table_log_channel_preferences()
+        except Exception:
+            pass
         self._update_table_display()
 
     def _create_layout(self) -> None:
@@ -3399,10 +4471,56 @@ class MainWindow(QMainWindow):
         )
         self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
 
-        # Left panel - Tune Tables
+        # Left panel - Tables
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
+
+        table_filters_row = QHBoxLayout()
+        table_filters_row.setContentsMargins(4, 4, 4, 4)
+        table_filters_row.setSpacing(8)
+
+        filter_btn_w = 48
+
+        self.favorite_tables_button = QPushButton()
+        self.favorite_tables_button.setCheckable(True)
+        self.favorite_tables_button.setFixedWidth(filter_btn_w)
+        self.favorite_tables_button.setToolTip("Favorite Tables Only")
+        star_pixmap = getattr(QStyle.StandardPixmap, "SP_StarButton", None)
+        if star_pixmap is not None:
+            self.favorite_tables_button.setIcon(self.style().standardIcon(star_pixmap))
+        else:
+            self.favorite_tables_button.setText("★")
+        self.favorite_tables_button.toggled.connect(self._on_only_show_favorited_toggled)
+
+        self.show_1d_tables_button = QPushButton("1D")
+        self.show_1d_tables_button.setCheckable(True)
+        self.show_1d_tables_button.setFixedWidth(filter_btn_w)
+        self.show_1d_tables_button.setToolTip("Show 1D tables")
+        self.show_1d_tables_button.toggled.connect(self._on_show_1d_tables_toggled)
+
+        self.show_2d_tables_button = QPushButton("2D")
+        self.show_2d_tables_button.setCheckable(True)
+        self.show_2d_tables_button.setFixedWidth(filter_btn_w)
+        self.show_2d_tables_button.setToolTip("Show 2D tables")
+        self.show_2d_tables_button.toggled.connect(self._on_show_2d_tables_toggled)
+
+        self._main_table_filter_group = QButtonGroup(self)
+        self._main_table_filter_group.setExclusive(True)
+        self._main_table_filter_group.addButton(self.favorite_tables_button)
+        self._main_table_filter_group.addButton(self.show_1d_tables_button)
+        self._main_table_filter_group.addButton(self.show_2d_tables_button)
+
+        table_filters_row.addStretch(1)
+        table_filters_row.addWidget(self.favorite_tables_button)
+        table_filters_row.addStretch(1)
+        table_filters_row.addWidget(self.show_1d_tables_button)
+        table_filters_row.addStretch(1)
+        table_filters_row.addWidget(self.show_2d_tables_button)
+        table_filters_row.addStretch(1)
+
+        left_layout.addLayout(table_filters_row)
+
         self.table_list = TuneTablesListWidget()
         self.table_list.on_tune_file_dropped = self._on_tune_file_dropped
         self.table_list.setStyleSheet(
@@ -3418,49 +4536,52 @@ class MainWindow(QMainWindow):
                 border: 1px solid palette(mid);
                 background-color: palette(base);
                 color: palette(text);
-                margin: 4px 6px;
-                padding: 8px 10px;
+                margin: 2px 6px;
+                padding: 5px 10px;
             }
             QListWidget::item:hover {
                 background-color: palette(alternate-base);
                 border: 1px solid palette(midlight);
             }
             QListWidget::item:selected {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-                border: 1px solid palette(light);
+                background-color: #2d5ecf;
+                color: #ffffff;
+                border: 1px solid #4b82ff;
             }
             """
         )
         self._add_open_tune_file_placeholder()
         self.table_list.currentItemChanged.connect(self._on_table_selected)
         self.table_list.itemClicked.connect(self._on_table_list_item_clicked)
+        self.table_list.itemDoubleClicked.connect(self._on_table_list_item_double_clicked)
         self.table_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_list.customContextMenuRequested.connect(self._show_table_context_menu)
         left_layout.addWidget(self.table_list)
+        self._sync_table_filter_buttons()
 
         # Selected table panel
         selected_table_panel = QWidget()
         selected_table_layout = QVBoxLayout(selected_table_panel)
         selected_table_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Header area: labels on the left, action button on the right spanning both rows.
+        header_layout = QGridLayout()
+
         self.table_meta = QLabel("No table selected")
-        selected_table_layout.addWidget(self.table_meta)
+        header_layout.addWidget(self.table_meta, 0, 0)
 
+        # Second row with axes labels
         self.axis_meta = QLabel("Axes: X (index), Y (index)")
-        selected_table_layout.addWidget(self.axis_meta)
+        header_layout.addWidget(self.axis_meta, 1, 0)
 
-        controls_layout = QHBoxLayout()
-        self.transpose_checkbox = QCheckBox("Transpose Table")
-        self.transpose_checkbox.toggled.connect(self._refresh_current_table_view)
-        controls_layout.addWidget(self.transpose_checkbox)
-
-        self.swap_axes_checkbox = QCheckBox("Swap Axes Labels")
-        self.swap_axes_checkbox.toggled.connect(self._refresh_current_table_view)
-        controls_layout.addWidget(self.swap_axes_checkbox)
-
-        controls_layout.addStretch(1)
-        selected_table_layout.addLayout(controls_layout)
+        self.plot_all_data_button = QPushButton("Plot All Data")
+        self.plot_all_data_button.setToolTip("Show all unfiltered scatterplot data for the selected table")
+        self.plot_all_data_button.clicked.connect(self._on_plot_all_data_requested)
+        self.plot_all_data_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
+        self.plot_all_data_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        header_layout.addWidget(self.plot_all_data_button, 0, 1, 2, 1)
+        header_layout.setColumnStretch(0, 1)
+        selected_table_layout.addLayout(header_layout)
 
         self.table_grid = CopyPasteTableWidget()
         self.table_grid.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -3494,8 +4615,14 @@ class MainWindow(QMainWindow):
 
         self.table_row_panel = RowVisualizationPanel()
         self.table_row_panel.on_point_selected = self._on_table_row_plot_point_selected
+        self.table_row_panel.on_scatter_preferences_requested = self._on_scatter_preferences_requested
+        self.table_row_panel.on_table_preferences_requested = self._on_table_preferences_requested
         self.table_row_panel.on_point_adjust_requested = self._on_table_row_plot_point_adjust_requested
         self.table_row_panel.on_visibility_changed = self._on_row_viz_visibility_changed
+        self.table_row_panel.on_log_playback_toggled = self._on_show_log_playback_toggled
+        self.table_row_panel.get_log_playback_state = lambda: self.show_log_playback
+        self.table_row_panel.on_plot_all_data_requested = self._on_plot_all_data_requested
+        self.table_row_panel.set_playback_controls_enabled(self.show_log_playback)
 
         self.table_row_editor_group = QGroupBox("")
         row_editor_layout = QVBoxLayout(self.table_row_editor_group)
@@ -3503,20 +4630,15 @@ class MainWindow(QMainWindow):
         row_editor_controls = QHBoxLayout()
         self.table_row_label = QLabel("Selected row: none")
         row_editor_controls.addWidget(self.table_row_label)
-        self.generate_average_button = QPushButton("Predict VE Value")
-        self.generate_average_button.setToolTip(
-            "Predict VE values from nearby logged VE points using EGO-corrected VE and matching AFR readings."
-        )
-        self.generate_average_button.clicked.connect(self._generate_average_line_from_log)
-        row_editor_controls.addWidget(self.generate_average_button)
-        self.apply_average_to_row_button = QPushButton("Apply Predictions")
-        self.apply_average_to_row_button.clicked.connect(self._apply_average_to_selected_row)
-        row_editor_controls.addWidget(self.apply_average_to_row_button)
         self.revert_row_changes_button = QPushButton("Revert Row")
         self.revert_row_changes_button.clicked.connect(self._revert_pending_row_values)
         row_editor_controls.addWidget(self.revert_row_changes_button)
         row_editor_controls.addStretch(1)
         row_editor_layout.addLayout(row_editor_controls)
+
+        self.table_row_status = QLabel("Select a VE table and click a row to view and edit it.")
+        self.table_row_status.setWordWrap(True)
+        row_editor_layout.addWidget(self.table_row_status)
 
         self.table_row_editor = RowEditorTableWidget()
         self.table_row_editor.on_adjust_value = self._adjust_pending_row_value
@@ -3540,13 +4662,9 @@ class MainWindow(QMainWindow):
         self.table_row_editor.setEnabled(False)
         self._set_row_editor_button_visibility(
             show_generate=False,
-            show_apply_predictions=False,
             show_write=False,
             show_revert=False,
         )
-
-        self.table_row_status = QLabel("Select a VE table and click a row to view and edit it.")
-        row_editor_container_layout.addWidget(self.table_row_status)
 
         # Wrap row visualization panel to avoid it inheriting dock margins directly.
         row_viz_container = QWidget()
@@ -3555,7 +4673,7 @@ class MainWindow(QMainWindow):
         row_viz_layout.addWidget(self.table_row_panel)
 
         self.tune_tables_dock = self._create_section_dock(
-            "Tune Tables",
+            "Tables",
             "tuneTablesDock",
             self._create_outlined_panel(left),
         )
@@ -3564,9 +4682,9 @@ class MainWindow(QMainWindow):
             "selectedTableDock",
             self._create_outlined_panel(selected_table_panel),
         )
-        self.row_viz_dock = self._create_section_dock("Row Data Visualization", "rowVizDock", row_viz_container)
+        self.row_viz_dock = self._create_section_dock("Scatterplot", "rowVizDock", row_viz_container)
         self.row_editor_dock = self._create_section_dock(
-            "Selected Row Editor",
+            "Row Editor",
             "rowEditorDock",
             self._create_outlined_panel(row_editor_container),
         )
@@ -3578,11 +4696,21 @@ class MainWindow(QMainWindow):
 
         self._apply_standard_window_layout()
 
-        self.view_menu.addSeparator()
-        self.view_menu.addAction(self.tune_tables_dock.toggleViewAction())
-        self.view_menu.addAction(self.selected_table_dock.toggleViewAction())
-        self.view_menu.addAction(self.row_viz_dock.toggleViewAction())
-        self.view_menu.addAction(self.row_editor_dock.toggleViewAction())
+        windows_tables_action = self.tune_tables_dock.toggleViewAction()
+        windows_tables_action.setText("Tables")
+        self.windows_menu.addAction(windows_tables_action)
+
+        windows_selected_tables_action = self.selected_table_dock.toggleViewAction()
+        windows_selected_tables_action.setText("Selected Tables")
+        self.windows_menu.addAction(windows_selected_tables_action)
+
+        windows_scatterplot_action = self.row_viz_dock.toggleViewAction()
+        windows_scatterplot_action.setText("Scatterplot")
+        self.windows_menu.addAction(windows_scatterplot_action)
+
+        windows_row_editor_action = self.row_editor_dock.toggleViewAction()
+        windows_row_editor_action.setText("Row Editor")
+        self.windows_menu.addAction(windows_row_editor_action)
 
     def _find_closest_index(self, values: list[float], target: float) -> int | None:
         """Find the index of the closest value in a list."""
@@ -3701,6 +4829,16 @@ class MainWindow(QMainWindow):
                 map_mask=map_mask,
                 filtered_rpm_values=filtered_rpm_values,
                 filtered_map_values=filtered_map_values,
+                map_value=map_value,
+                map_series=map_series,
+                rpm_series=rpm_series,
+            )
+            self._apply_afr_prediction_to_payload(
+                table_name=table_name,
+                point_sets=point_sets,
+                table_rpm_values=rpm_point_values,
+                map_mask=map_mask,
+                filtered_rpm_values=filtered_rpm_values,
             )
             stats += f"\n\nLogged Data ({len(filtered_rpm)} points):\n"
             stats += f"RPM range: {filtered_rpm.min():.0f} - {filtered_rpm.max():.0f}"
@@ -3720,6 +4858,300 @@ class MainWindow(QMainWindow):
                 "y_label": y_label,
             }
 
+    def _build_all_data_visualization_payload(self) -> dict[str, Any] | None:
+        """Build a row-viz payload containing ALL log scatter data with no MAP band filter.
+
+        The "table" (selected-row) series is intentionally excluded so only the unfiltered
+        log point clouds are shown.
+        """
+        if self.current_table is None or self.current_x_axis is None:
+            return None
+
+        table_name = self._current_table_name()
+        if table_name is None:
+            return None
+
+        y_label = self.current_table.units if self.current_table.units else "Value"
+        title = f"All Log Data — {table_name}"
+
+        if self.log_df is None or self.log_df.empty:
+            return {
+                "title": title,
+                "stats": "No log data loaded.",
+                "available_series": [],
+                "series_visibility": {},
+                "point_sets": [],
+                "y_label": y_label,
+            }
+
+        # Locate the RPM channel.
+        rpm_channel: str | None = None
+        for col in self.log_df.columns:
+            col_lower = str(col).lower()
+            if not rpm_channel and ("rpm" in col_lower or "engine speed" in col_lower):
+                rpm_channel = str(col)
+                break
+
+        if rpm_channel is None:
+            return {
+                "title": title,
+                "stats": "RPM channel not found in log data.",
+                "available_series": [],
+                "series_visibility": {},
+                "point_sets": [],
+                "y_label": y_label,
+            }
+
+        rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
+        if rpm_series is None:
+            return {
+                "title": title,
+                "stats": "Could not convert RPM data to numeric values.",
+                "available_series": [],
+                "series_visibility": {},
+                "point_sets": [],
+                "y_label": y_label,
+            }
+
+        table_prefs = self.table_log_channel_preferences.get(table_name, {})
+        if not isinstance(table_prefs, dict) or not table_prefs:
+            return {
+                "title": title,
+                "stats": "No scatter channels configured for this table.\n\nConfigure channels via Table Preferences.",
+                "available_series": [],
+                "series_visibility": {},
+                "point_sets": [],
+                "y_label": y_label,
+            }
+
+        custom_defs = self._custom_identifier_definitions()
+        series_cache: dict[str, Any] = {}
+
+        # Resolve the time column for playback support.
+        time_column: str | None = None
+        for col in self.log_df.columns:
+            if str(col).strip().lower() == "time":
+                time_column = str(col)
+                break
+
+        time_series_all: Any = None
+        if time_column is not None:
+            try:
+                time_series_all = self._to_numeric_series(self.log_df[time_column])
+            except Exception:
+                time_series_all = None
+
+        point_sets: list[dict[str, Any]] = []
+        total_points = 0
+
+        for channel_name, prefs in table_prefs.items():
+            if not isinstance(prefs, dict):
+                continue
+            if not bool(prefs.get("show_in_scatterplot", False)):
+                continue
+
+            numeric_series = self._resolve_identifier_series(
+                channel_name,
+                custom_defs=custom_defs,
+                cache=series_cache,
+                stack=set(),
+            )
+            if numeric_series is None:
+                continue
+
+            rpm_vals: list[float] = []
+            channel_vals: list[float] = []
+            scatter_time_values: list[float | None] = []
+
+            n = min(len(rpm_series), len(numeric_series))
+            for i in range(n):
+                try:
+                    rpm_val = float(rpm_series.iloc[i])
+                    ch_val = float(numeric_series.iloc[i])
+                except Exception:
+                    continue
+                if rpm_val != rpm_val or ch_val != ch_val:  # NaN check
+                    continue
+                rpm_vals.append(rpm_val)
+                channel_vals.append(ch_val)
+                if time_series_all is not None:
+                    try:
+                        tv = float(time_series_all.iloc[i])
+                        scatter_time_values.append(tv if tv == tv else None)
+                    except Exception:
+                        scatter_time_values.append(None)
+
+            if not rpm_vals:
+                continue
+
+            total_points += len(rpm_vals)
+            point_sets.append(
+                {
+                    "series_id": f"log::{channel_name}",
+                    "name": channel_name,
+                    "rpm": rpm_vals,
+                    "ve": channel_vals,
+                    "detail_channels": {},
+                    "scatter_color": str(prefs.get("scatter_color", "")),
+                    "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                    "time": scatter_time_values,
+                }
+            )
+
+        stats = f"All log data for {table_name}\nTotal points: {total_points}"
+        return {
+            "title": title,
+            "stats": stats,
+            "available_series": [],
+            "series_visibility": {},
+            "point_sets": point_sets,
+            "y_label": y_label,
+        }
+
+    def _on_plot_all_data_requested(self) -> None:
+        """Load all unfiltered log scatter data for the current table into the row viz panel."""
+        payload = self._build_all_data_visualization_payload()
+        if payload is None:
+            return
+        # Use a distinct dataset key so that a subsequent row selection always re-views.
+        self._last_row_viz_dataset_key = ("all_data", self._current_table_name())
+        self.table_row_panel.set_row_data(payload, auto_view_all=True)
+
+    @staticmethod
+    def _simple_linear_regression(
+        x_vals: list[float], y_vals: list[float]
+    ) -> tuple[float, float] | None:
+        """Return (slope, intercept) for y = slope*x + intercept via least-squares.
+
+        Returns None when fewer than 3 points or the x-values have no variance.
+        """
+        n = len(x_vals)
+        if n < 3 or n != len(y_vals):
+            return None
+        sx = sum(x_vals)
+        sy = sum(y_vals)
+        sxx = sum(xi * xi for xi in x_vals)
+        sxy = sum(xi * yi for xi, yi in zip(x_vals, y_vals))
+        denom = n * sxx - sx * sx
+        if abs(denom) < 1e-12:
+            return None
+        slope = (n * sxy - sx * sy) / denom
+        intercept = (sy - slope * sx) / n
+        return slope, intercept
+
+    def _apply_afr_prediction_to_payload(
+        self,
+        table_name: str,
+        point_sets: list[dict[str, Any]],
+        table_rpm_values: list[float],
+        map_mask: Any,
+        filtered_rpm_values: list[float],
+    ) -> None:
+        """Compute predicted AFR for each table RPM column and store in extra_channels.
+
+        For each column, this gathers ALL log data points inside the MAP band
+        whose RPM is within tolerance, then fits a local linear regression of
+        AFR vs VE Actual.  The regression line is evaluated at the current table
+        VE value to produce a smooth predicted AFR that changes predictably as
+        the user edits the VE cell.  When fewer than 3 points are available for
+        regression the simple mean AFR of the neighbourhood is used instead.
+        """
+        if self.log_df is None or self.log_df.empty or not point_sets:
+            return
+
+        # Check per-table enable flag
+        table_plugins = self.table_log_channel_preferences.get("__table_plugins__", {})
+        if not isinstance(table_plugins, dict):
+            return
+        table_plugin_map = table_plugins.get(table_name, {})
+        if not isinstance(table_plugin_map, dict) or not bool(table_plugin_map.get("afr_prediction", False)):
+            return
+
+        # Get identifier names from Advanced preferences
+        adv = self.table_log_channel_preferences.get("__advanced__", {})
+        if not isinstance(adv, dict):
+            return
+        afr_cfg = adv.get("afr_prediction", {})
+        if not isinstance(afr_cfg, dict):
+            return
+        ve_actual_id = str(afr_cfg.get("ve_actual_identifier", "")).strip()
+        afr_id = str(afr_cfg.get("afr_identifier", "")).strip()
+        if not ve_actual_id or not afr_id:
+            return
+
+        # Resolve both series from the log
+        custom_defs = self._custom_identifier_definitions()
+        cache: dict[str, Any] = {}
+        ve_actual_series = self._resolve_identifier_series(ve_actual_id, custom_defs, cache, set())
+        afr_series = self._resolve_identifier_series(afr_id, custom_defs, cache, set())
+        if ve_actual_series is None or afr_series is None:
+            return
+
+        # Filter to the rows matching the current MAP band
+        try:
+            ve_actual_filtered = list(ve_actual_series[map_mask])
+            afr_filtered = list(afr_series[map_mask])
+        except Exception:
+            return
+
+        n_log = min(len(filtered_rpm_values), len(ve_actual_filtered), len(afr_filtered))
+        if n_log == 0:
+            return
+
+        rpm_tol = 150.0
+
+        table_series = point_sets[0]
+        table_ve_values = table_series.get("ve", [])
+
+        predicted_afr: list[float | None] = []
+        predicted_afr_counts: list[int | None] = []
+        for i, rpm_val in enumerate(table_rpm_values):
+            ve_val = float(table_ve_values[i]) if i < len(table_ve_values) else None
+
+            # Gather ALL log points near this RPM (no VE filter)
+            local_ve: list[float] = []
+            local_afr: list[float] = []
+            for j in range(n_log):
+                if abs(float(filtered_rpm_values[j]) - rpm_val) > rpm_tol:
+                    continue
+                try:
+                    log_ve = float(ve_actual_filtered[j])
+                    afr_val = float(afr_filtered[j])
+                    # Exclude NaN
+                    if log_ve != log_ve or afr_val != afr_val:
+                        continue
+                    local_ve.append(log_ve)
+                    local_afr.append(afr_val)
+                except Exception:
+                    continue
+
+            if not local_afr:
+                predicted_afr.append(None)
+                predicted_afr_counts.append(None)
+                continue
+
+            if ve_val is None:
+                # No table VE to evaluate against; use simple mean
+                predicted_afr.append(sum(local_afr) / len(local_afr))
+                predicted_afr_counts.append(len(local_afr))
+                continue
+
+            # Try local linear regression of AFR vs VE Actual
+            fit = self._simple_linear_regression(local_ve, local_afr)
+            if fit is not None:
+                slope, intercept = fit
+                predicted_afr.append(slope * ve_val + intercept)
+            else:
+                # Not enough data for regression; fall back to mean
+                predicted_afr.append(sum(local_afr) / len(local_afr))
+            predicted_afr_counts.append(len(local_afr))
+
+        if any(v is not None for v in predicted_afr):
+            extra_channels = table_series.setdefault("extra_channels", {})
+            extra_channels["Predicted AFR"] = predicted_afr
+            count_channels = table_series.setdefault("count_channels", {})
+            count_channels["Prediction Points"] = predicted_afr_counts
+
     def _apply_table_log_channel_preferences_to_payload(
         self,
         table_name: str,
@@ -3728,6 +5160,9 @@ class MainWindow(QMainWindow):
         map_mask: Any,
         filtered_rpm_values: list[float],
         filtered_map_values: list[float],
+        map_value: float | None = None,
+        map_series: Any = None,
+        rpm_series: Any = None,
     ) -> None:
         if self.log_df is None or self.log_df.empty or not point_sets:
             return
@@ -3743,13 +5178,19 @@ class MainWindow(QMainWindow):
         custom_defs = self._custom_identifier_definitions()
         series_cache: dict[str, Any] = {}
 
+        # Resolve log time column for playback support
+        time_column: str | None = None
+        for col in self.log_df.columns:
+            if str(col).strip().lower() == "time":
+                time_column = str(col)
+                break
+
         for channel_name, prefs in table_prefs.items():
             if not isinstance(prefs, dict):
                 continue
 
             show_scatter = bool(prefs.get("show_in_scatterplot", False))
-            show_selected = bool(prefs.get("show_when_point_selected", False))
-            if not show_scatter and not show_selected:
+            if not show_scatter:
                 continue
 
             numeric_series = self._resolve_identifier_series(
@@ -3761,23 +5202,34 @@ class MainWindow(QMainWindow):
             if numeric_series is None:
                 continue
 
-            filtered_series = numeric_series[map_mask]
+            # Compute per-channel MAP mask if a tolerance override is set
+            tol_override = int(prefs.get("map_tolerance", 0))
+            if tol_override > 0 and map_value is not None and map_series is not None and rpm_series is not None:
+                ch_map_mask = (map_series >= map_value - tol_override) & (map_series <= map_value + tol_override)
+                ch_filtered_rpm_values = [float(v) for v in rpm_series[ch_map_mask]]
+                ch_filtered_map_values = [float(v) for v in map_series[ch_map_mask]]
+            else:
+                ch_map_mask = map_mask
+                ch_filtered_rpm_values = filtered_rpm_values
+                ch_filtered_map_values = filtered_map_values
+
+            filtered_series = numeric_series[ch_map_mask]
             filtered_channel_values: list[float | None] = []
             for raw_value in filtered_series:
                 value = float(raw_value)
                 filtered_channel_values.append(value if value == value else None)
 
             valid_points = [
-                (float(filtered_rpm_values[idx]), float(filtered_map_values[idx]), float(val))
+                (float(ch_filtered_rpm_values[idx]), float(ch_filtered_map_values[idx]), float(val))
                 for idx, val in enumerate(filtered_channel_values)
-                if idx < len(filtered_rpm_values) and idx < len(filtered_map_values) and val is not None
+                if idx < len(ch_filtered_rpm_values) and idx < len(ch_filtered_map_values) and val is not None
             ]
 
             if show_scatter and valid_points:
                 source_indices = [
                     idx
                     for idx, val in enumerate(filtered_channel_values)
-                    if idx < len(filtered_rpm_values) and idx < len(filtered_map_values) and val is not None
+                    if idx < len(ch_filtered_rpm_values) and idx < len(ch_filtered_map_values) and val is not None
                 ]
                 detail_channels: dict[str, list[float | None]] = {}
                 for detail_name in self._point_cloud_detail_channels(channel_name):
@@ -3789,7 +5241,7 @@ class MainWindow(QMainWindow):
                     )
                     if detail_series is None:
                         continue
-                    detail_filtered = detail_series[map_mask]
+                    detail_filtered = detail_series[ch_map_mask]
                     detail_filtered_values: list[float | None] = []
                     for raw_value in detail_filtered:
                         detail_value = float(raw_value)
@@ -3801,6 +5253,22 @@ class MainWindow(QMainWindow):
                             continue
                         detail_values.append(detail_filtered_values[source_idx])
                     detail_channels[detail_name] = detail_values
+
+                # Extract time values for playback
+                scatter_time_values: list[float | None] = []
+                if time_column is not None:
+                    try:
+                        time_series = self._to_numeric_series(self.log_df[time_column])
+                        if time_series is not None:
+                            time_filtered = list(time_series[ch_map_mask])
+                            for source_idx in source_indices:
+                                if source_idx < len(time_filtered):
+                                    tv = float(time_filtered[source_idx])
+                                    scatter_time_values.append(tv if tv == tv else None)
+                                else:
+                                    scatter_time_values.append(None)
+                    except Exception:
+                        scatter_time_values = []
 
                 point_sets.append(
                     {
@@ -3814,10 +5282,11 @@ class MainWindow(QMainWindow):
                         "detail_channels": detail_channels,
                         "scatter_color": str(prefs.get("scatter_color", "")),
                         "scatter_opacity": max(0, min(100, int(prefs.get("scatter_opacity", 70)))),
+                        "time": scatter_time_values,
                     }
                 )
 
-            if show_selected and valid_points:
+            if valid_points:
                 valid_rpm_values = [p[0] for p in valid_points]
                 valid_channel_values = [p[2] for p in valid_points]
                 extra_channels[channel_name] = [
@@ -3861,175 +5330,6 @@ class MainWindow(QMainWindow):
         self.table_grid.blockSignals(False)
         self._load_selected_table_row(self.selected_table_row_idx)
 
-    def _generate_average_line_from_log(self) -> None:
-        """Predict VE values from AFR and EGO-corrected VE log data for the current MAP row."""
-        if self.current_table is None or "ve" not in self.current_table.name.lower():
-            self.table_row_status.setText("VE prediction is currently available for VE rows.")
-            return
-
-        if self.log_df is None or self.log_df.empty:
-            self.table_row_status.setText("No log data loaded. Cannot predict VE.")
-            return
-
-        if self.selected_table_row_idx is None or self.current_y_axis is None or self.current_x_axis is None:
-            self.table_row_status.setText("Select a row first.")
-            return
-
-        map_value = float(self.current_y_axis.values[self.selected_table_row_idx])
-
-        # Find relevant columns in log data
-        rpm_channel = None
-        map_channel = None
-        ve1_channel = None
-        ego_cor1_channel = None
-        afr_channel = None
-        afr_target_channel = None
-
-        for col in self.log_df.columns:
-            col_lower = str(col).lower()
-            if not rpm_channel and ('rpm' in col_lower or 'engine speed' in col_lower):
-                rpm_channel = str(col)
-            if not map_channel and ('map' in col_lower):
-                map_channel = str(col)
-            if not ve1_channel and ('ve1' in col_lower or 've 1' in col_lower):
-                ve1_channel = str(col)
-            if not ego_cor1_channel and ('ego' in col_lower and 'cor1' in col_lower):
-                ego_cor1_channel = str(col)
-            if not afr_target_channel and ('afr' in col_lower or 'lambda' in col_lower) and ('target' in col_lower or 'tgt' in col_lower):
-                afr_target_channel = str(col)
-            if (
-                not afr_channel
-                and ('afr' in col_lower or 'lambda' in col_lower)
-                and 'target' not in col_lower
-                and 'tgt' not in col_lower
-                and 'error' not in col_lower
-                and 'err' not in col_lower
-            ):
-                afr_channel = str(col)
-
-        if not rpm_channel or not map_channel or not ve1_channel:
-            self.table_row_status.setText("Required log columns not found (RPM, MAP, VE1).")
-            return
-
-        if not afr_channel:
-            self.table_row_status.setText("AFR channel not found in log. Cannot predict VE without AFR readings.")
-            return
-
-        # Convert to numeric series
-        rpm_series = self._to_numeric_series(self.log_df[rpm_channel])
-        map_series = self._to_numeric_series(self.log_df[map_channel])
-        ve_series = self._to_numeric_series(self.log_df[ve1_channel])
-        afr_series = self._to_numeric_series(self.log_df[afr_channel])
-        afr_target_series = self._to_numeric_series(self.log_df[afr_target_channel]) if afr_target_channel else None
-
-        if rpm_series is None or map_series is None or ve_series is None or afr_series is None:
-            self.table_row_status.setText("Could not convert log data to numeric values.")
-            return
-
-        # Apply EGO correction to VE
-        ve_corrected_series = ve_series.copy()
-        if ego_cor1_channel is not None:
-            ego_series = self._to_numeric_series(self.log_df[ego_cor1_channel])
-            if ego_series is not None:
-                ve_corrected_series = ve_series * (ego_series / 100.0)
-
-        # Calculate adaptive MAP tolerance
-        map_tolerance = 10.0
-        if self.current_y_axis is not None and len(self.current_y_axis.values) > 1:
-            sorted_bins = sorted(float(v) for v in self.current_y_axis.values)
-            min_spacing = min(abs(b - a) for a, b in zip(sorted_bins, sorted_bins[1:]))
-            map_tolerance = max(10.0, min_spacing * 0.75)
-
-        # Filter to current MAP bin
-        map_mask = (map_series >= map_value - map_tolerance) & (map_series <= map_value + map_tolerance)
-        filtered_rpm = rpm_series[map_mask]
-        filtered_map = map_series[map_mask]
-        filtered_ve_corrected = ve_corrected_series[map_mask]
-        filtered_afr = afr_series[map_mask]
-        filtered_afr_target = afr_target_series[map_mask] if afr_target_series is not None else None
-
-        if len(filtered_rpm) == 0:
-            self.table_row_status.setText(f"No log data near MAP {map_value} kPa.")
-            return
-
-        filtered_rpm_values = [float(v) for v in filtered_rpm]
-        filtered_map_values = [float(v) for v in filtered_map]
-        filtered_ve_corrected_values = [float(v) for v in filtered_ve_corrected]
-        filtered_afr_values: list[float | None] = [float(v) for v in filtered_afr]
-        filtered_afr_target_values: list[float | None] = (
-            [float(v) for v in filtered_afr_target] if filtered_afr_target is not None else [None] * len(filtered_rpm_values)
-        )
-
-        # Predict VE for each RPM bin using AFR-based weighted neighbor averaging
-        rpm_bins = [float(v) for v in self.current_x_axis.values]
-        average_rpm_values: list[float] = []
-        average_ve_values: list[float] = []
-        average_afr_target_values: list[float | None] = []
-
-        for target_rpm in rpm_bins:
-            # Determine the target AFR for this bin from nearby log points
-            rpm_tolerance = 500.0
-            if len(rpm_bins) > 1:
-                sorted_rpms = sorted(rpm_bins)
-                min_spacing = min(abs(b - a) for a, b in zip(sorted_rpms, sorted_rpms[1:]))
-                rpm_tolerance = max(300.0, min_spacing * 0.4)
-
-            rpm_mask_bin = [abs(r - target_rpm) <= rpm_tolerance for r in filtered_rpm_values]
-            nearby_afr_target = [v for v, m in zip(filtered_afr_target_values, rpm_mask_bin) if m and v is not None]
-            if afr_target_channel is not None and len(nearby_afr_target) < 2:
-                continue
-            target_afr = float(sum(nearby_afr_target) / len(nearby_afr_target)) if nearby_afr_target else 14.7
-
-            predicted_ve = self._predict_ve_from_neighbors(
-                target_rpm=target_rpm,
-                target_map=map_value,
-                target_afr=target_afr,
-                rpm_values=filtered_rpm_values,
-                map_values=filtered_map_values,
-                ve_corrected_values=filtered_ve_corrected_values,
-                afr_values=filtered_afr_values,
-            )
-
-            if predicted_ve is not None:
-                average_rpm_values.append(target_rpm)
-                average_ve_values.append(self._round_ve_prediction(predicted_ve))
-                average_afr_target_values.append(target_afr)
-
-        if not average_rpm_values:
-            self.table_row_status.setText("Could not predict VE values from log data for this MAP.")
-            return
-
-        skipped_points = len(rpm_bins) - len(average_rpm_values)
-
-        # Store the prediction data for display
-        self.average_line_data = {
-            "series_id": "average",
-            "name": "Predicted VE",
-            "rpm": average_rpm_values,
-            "ve": average_ve_values,
-            "map": [map_value] * len(average_rpm_values),
-            "ve_raw": average_ve_values,
-            "ve_scaled": average_ve_values,
-            "afr": [None] * len(average_rpm_values),
-            "afr_target": average_afr_target_values,
-            "afr_error": [None] * len(average_rpm_values),
-        }
-
-        self.table_row_status.setText(
-            f"Predicted VE from {len(filtered_rpm)} log points near MAP {map_value} kPa "
-            f"using AFR{'+ target' if afr_target_channel else ' (14.7 default target)'}; "
-            f"predicted {len(average_rpm_values)}/{len(rpm_bins)} row points"
-            f"{f', skipped {skipped_points} for low data' if skipped_points > 0 else ''}."
-        )
-        self._set_row_editor_button_visibility(
-            show_generate=True,
-            show_apply_predictions=True,
-            show_write=bool(self.pending_row_values),
-            show_revert=bool(self.pending_row_values),
-        )
-        self._update_table_grid_row_visualization()
-
-
     def _interpolate_average_value(self, x_points: list[float], y_points: list[float], target_x: float) -> float:
         if len(x_points) == 1:
             return float(y_points[0])
@@ -4053,80 +5353,8 @@ class MainWindow(QMainWindow):
         return float(y_points[-1])
 
     def _on_row_editor_context_menu(self, pos) -> None:
-        """Show context menu on a row editor cell when prediction data is available for that RPM bin."""
-        if self.average_line_data is None or self.current_x_axis is None:
-            return
-
-        item = self.table_row_editor.itemAt(pos)
-        if item is None:
-            return
-
-        col = self.table_row_editor.column(item)
-        if col < 0 or col >= len(self.current_x_axis.values):
-            return
-
-        target_rpm = float(self.current_x_axis.values[col])
-        avg_rpm_values = [float(v) for v in self.average_line_data.get("rpm", [])]
-        avg_ve_values = [float(v) for v in self.average_line_data.get("ve", [])]
-        avg_by_rpm = dict(zip(avg_rpm_values, avg_ve_values))
-
-        if target_rpm not in avg_by_rpm:
-            return
-
-        avg_value = avg_by_rpm[target_rpm]
-        menu = QMenu(self)
-        apply_action = menu.addAction(f"Apply Prediction ({avg_value:.4g}) to This Cell")
-        result = menu.exec(self.table_row_editor.viewport().mapToGlobal(pos))
-        if result is apply_action:
-            old_value = float(self.pending_row_values[col])
-            self.pending_row_values[col] = avg_value
-            table_name = self._current_table_name()
-            cell_coords = self._current_editor_cell_coordinates(col)
-            if table_name is not None and cell_coords is not None:
-                row_index, source_col = cell_coords
-                self._record_global_cell_edit(table_name, row_index, source_col, old_value, float(avg_value))
-            self._refresh_table_row_editor()
-            self._update_table_grid_row_visualization(include_row_plot=False)
-            self._schedule_table_grid_row_visualization_update()
-
-    def _apply_average_to_selected_row(self) -> None:
-        if (
-            self.average_line_data is None
-            or self.current_x_axis is None
-            or not self.pending_row_values
-            or self.current_table is None
-            or "ve" not in self.current_table.name.lower()
-        ):
-            self.table_row_status.setText("Generate a predicted VE line first.")
-            return
-
-        avg_rpm_values = [float(v) for v in self.average_line_data.get("rpm", [])]
-        avg_ve_values = [float(v) for v in self.average_line_data.get("ve", [])]
-        if not avg_rpm_values or not avg_ve_values or len(avg_rpm_values) != len(avg_ve_values):
-            self.table_row_status.setText("Prediction data is not available to apply.")
-            return
-
-        # Build a lookup of RPM bins that actually have averaged data
-        avg_by_rpm = dict(zip(avg_rpm_values, avg_ve_values))
-
-        new_pending = list(self.pending_row_values)
-        table_name = self._current_table_name()
-        for i, target_rpm in enumerate(self.current_x_axis.values):
-            rpm_key = float(target_rpm)
-            if rpm_key in avg_by_rpm:
-                old_value = float(new_pending[i])
-                new_value = float(avg_by_rpm[rpm_key])
-                new_pending[i] = new_value
-                cell_coords = self._current_editor_cell_coordinates(i)
-                if table_name is not None and cell_coords is not None:
-                    row_index, source_col = cell_coords
-                    self._record_global_cell_edit(table_name, row_index, source_col, old_value, new_value)
-        self.pending_row_values = new_pending
-        self._refresh_table_row_editor()
-        self._update_table_grid_row_visualization(include_row_plot=False)
-        self._schedule_table_grid_row_visualization_update()
-        applied_count = len(avg_rpm_values)
-        self.table_row_status.setText(f"Applied predictions to {applied_count} of {len(self.current_x_axis.values)} cells with log data.")
+        _ = pos
+        return
 
     def _update_table_grid_row_visualization(self, include_row_plot: bool = True) -> None:
         self._stage_current_row_edits()
@@ -4161,7 +5389,6 @@ class MainWindow(QMainWindow):
             self.table_row_label.setText("Selected row: full 1D table")
             self._set_row_editor_button_visibility(
                 show_generate=False,
-                show_apply_predictions=False,
                 show_write=False,
                 show_revert=bool(self.pending_row_values),
             )
@@ -4189,12 +5416,6 @@ class MainWindow(QMainWindow):
         cursor_y_label = self._axis_title("Y", self.current_y_axis)
         payload = self._build_row_visualization_payload(map_value, self.current_x_axis.values, self.pending_row_values)
         
-        # Add predicted VE line if it has been generated
-        if self.average_line_data is not None and "ve" in table_name:
-            point_sets = payload.get("point_sets", [])
-            point_sets.append(self.average_line_data)
-            payload["point_sets"] = point_sets
-
         payload["available_series"] = self._row_viz_available_series(table_type, payload)
         payload["series_visibility"] = self.row_viz_preferences.get(table_type, {})
         payload["table_type"] = table_type
@@ -4206,10 +5427,8 @@ class MainWindow(QMainWindow):
         if not auto_view_all and selected_table_point_index is not None:
             self.table_row_panel.select_table_point(selected_table_point_index)
         self._last_row_viz_dataset_key = dataset_key
-        status_message = f"Editing MAP {map_value:g} kPa for {self.current_table.name}. Changes are previewed below as a modified table."
-        prediction_summary = self._current_editor_prediction_summary(payload)
-        if prediction_summary:
-            status_message = f"{status_message} {prediction_summary}"
+        y_label = self._axis_title("Y", self.current_y_axis)
+        status_message = f"Editing {y_label} = {map_value:g} for {self.current_table.name}"
         self.table_row_status.setText(status_message)
 
     def _schedule_table_grid_row_visualization_update(self, delay_ms: int = 60) -> None:
@@ -4263,39 +5482,6 @@ class MainWindow(QMainWindow):
                 else:
                     item.setBackground(self._cell_color(value, minimum, span))
 
-    def _current_editor_prediction_summary(self, payload: dict[str, Any]) -> str:
-        if self._row_table_type() != "ve":
-            return ""
-        if self.table_row_editor.columnCount() <= 0:
-            return ""
-        current_column = self.table_row_editor.currentColumn()
-        if current_column < 0:
-            return ""
-
-        table_series: dict[str, Any] | None = None
-        for series in payload.get("point_sets", []):
-            if isinstance(series, dict) and str(series.get("series_id")) == "table":
-                table_series = series
-                break
-        if table_series is None:
-            return ""
-
-        afr_predicted = None
-        afr_target = None
-        predicted_values = table_series.get("afr_predicted", [])
-        target_values = table_series.get("afr_target", [])
-        if isinstance(predicted_values, list) and 0 <= current_column < len(predicted_values):
-            afr_predicted = predicted_values[current_column]
-        if isinstance(target_values, list) and 0 <= current_column < len(target_values):
-            afr_target = target_values[current_column]
-
-        if afr_predicted is None and afr_target is None:
-            return ""
-
-        predicted_text = "n/a" if afr_predicted is None else f"{float(afr_predicted):.2f}"
-        target_text = "n/a" if afr_target is None else f"{float(afr_target):.2f}"
-        return f"Selected-cell AFR predicted: {predicted_text} | AFR target: {target_text}."
-
     def _table_row_editing_available(self) -> tuple[bool, str]:
         if not self.current_table or not self.current_x_axis or not self.current_y_axis:
             return False, "Select a table and click a row to view and edit it."
@@ -4303,8 +5489,7 @@ class MainWindow(QMainWindow):
         if self._is_current_table_1d():
             return True, ""
 
-        if self.transpose_checkbox.isChecked() or self.swap_axes_checkbox.isChecked():
-            return False, "Disable Transpose Table and Swap Axes Labels to edit rows from the table grid."
+
         return True, ""
 
     def _clear_table_row_editor(self, status_message: str) -> None:
@@ -4315,7 +5500,6 @@ class MainWindow(QMainWindow):
         self.row_edit_undo_stack = []
         self._active_row_edit_column = None
         self._active_row_edit_snapshot = None
-        self.average_line_data = None
         self.modified_table_meta.setVisible(False)
         self.modified_table_grid.setVisible(False)
         self.modified_table_grid.clear()
@@ -4328,7 +5512,6 @@ class MainWindow(QMainWindow):
         self.table_row_editor.setEnabled(False)
         self._set_row_editor_button_visibility(
             show_generate=False,
-            show_apply_predictions=False,
             show_write=False,
             show_revert=False,
         )
@@ -4439,8 +5622,6 @@ class MainWindow(QMainWindow):
             self.row_edit_undo_stack = []
             self._active_row_edit_column = None
             self._active_row_edit_snapshot = None
-            saved = self.pending_edits_per_table.get(table_name, {})
-            self.average_line_data = saved.get("average_line_data")
             self.table_row_label.setText("Selected row: full 1D table")
             self._refresh_table_row_editor(preferred_column=preferred_column, select_cell=select_editor_cell)
             self._update_table_grid_row_visualization()
@@ -4456,8 +5637,6 @@ class MainWindow(QMainWindow):
         self.row_edit_undo_stack = []
         self._active_row_edit_column = None
         self._active_row_edit_snapshot = None
-        saved = self.pending_edits_per_table.get(table_name, {})
-        self.average_line_data = saved.get("average_line_data")
         map_value = float(self.current_y_axis.values[source_row])
         self.table_row_label.setText(f"Selected row: MAP {map_value:g} kPa")
         self._refresh_table_row_editor(preferred_column=preferred_column, select_cell=select_editor_cell)
@@ -4492,14 +5671,8 @@ class MainWindow(QMainWindow):
         self.table_row_editor.resizeColumnsToContents()
         self.table_row_editor.resizeRowsToContents()
         self.table_row_editor.setEnabled(True)
-        can_predict_ve = (
-            self.current_table is not None
-            and "ve" in self.current_table.name.lower()
-            and not self._is_current_table_1d()
-        )
         self._set_row_editor_button_visibility(
-            show_generate=can_predict_ve,
-            show_apply_predictions=can_predict_ve and self.average_line_data is not None,
+            show_generate=False,
             show_write=False,
             show_revert=bool(self.pending_row_values),
         )
@@ -4546,6 +5719,12 @@ class MainWindow(QMainWindow):
     def _redo_pending_row_edit(self, column_index: int | None = None) -> None:
         _ = column_index
         self._trigger_global_redo()
+
+    def _on_scatter_preferences_requested(self, identifier: str | None) -> None:
+        self._open_preferences(initial_scatter_identifier=identifier)
+
+    def _on_table_preferences_requested(self) -> None:
+        self._open_preferences()
 
     def _on_table_row_plot_point_selected(
         self,
@@ -4986,7 +6165,7 @@ class MainWindow(QMainWindow):
 
         table_state = self.pending_edits_per_table.setdefault(
             table_name,
-            {"rows": {}, "one_d": None, "average_line_data": None},
+            {"rows": {}, "one_d": None},
         )
         rows_state = table_state.setdefault("rows", {})
 
@@ -4997,7 +6176,6 @@ class MainWindow(QMainWindow):
                 table_state["one_d"] = staged_values
             else:
                 table_state["one_d"] = None
-            table_state["average_line_data"] = self.average_line_data
         else:
             if self.selected_table_row_idx is None:
                 return
@@ -5007,7 +6185,6 @@ class MainWindow(QMainWindow):
                 rows_state[self.selected_table_row_idx] = staged_values
             else:
                 rows_state.pop(self.selected_table_row_idx, None)
-            table_state["average_line_data"] = self.average_line_data
 
         if not table_state.get("rows") and table_state.get("one_d") is None:
             self.pending_edits_per_table.pop(table_name, None)
@@ -5087,8 +6264,6 @@ class MainWindow(QMainWindow):
                 self._load_selected_table_row(saved_row_idx)
 
         if table_name in self.pending_edits_per_table:
-            saved = self.pending_edits_per_table[table_name]
-            self.average_line_data = saved.get("average_line_data")
             self._refresh_current_table_view()
 
     def _refresh_current_table_view(self) -> None:
@@ -5106,8 +6281,6 @@ class MainWindow(QMainWindow):
             table.cols == 1
             and table.rows > 1
             and row_count == 1
-            and not self.transpose_checkbox.isChecked()
-            and not self.swap_axes_checkbox.isChecked()
         ):
             y_labels = ["Values"]
         x_labels = self._header_labels(display_x_axis, col_count)
@@ -5191,8 +6364,6 @@ class MainWindow(QMainWindow):
             table.cols == 1
             and table.rows > 1
             and row_count == 1
-            and not self.transpose_checkbox.isChecked()
-            and not self.swap_axes_checkbox.isChecked()
         ):
             y_labels = ["Values"]
         x_labels = self._header_labels(display_x_axis, col_count)
@@ -5400,13 +6571,6 @@ class MainWindow(QMainWindow):
                 values=[1.0],
             )
 
-        if self.transpose_checkbox.isChecked():
-            matrix = [list(col) for col in zip(*matrix)]
-            display_x_axis, display_y_axis = display_y_axis, display_x_axis
-
-        if self.swap_axes_checkbox.isChecked():
-            display_x_axis, display_y_axis = display_y_axis, display_x_axis
-
         return matrix, display_x_axis, display_y_axis
 
     @staticmethod
@@ -5555,52 +6719,8 @@ class MainWindow(QMainWindow):
         return MainWindow._weighted_average(predicted_values, weights)
 
     @staticmethod
-    def _predict_ve_from_neighbors(
-        target_rpm: float,
-        target_map: float,
-        target_afr: float,
-        rpm_values: list[float],
-        map_values: list[float],
-        ve_corrected_values: list[float],
-        afr_values: list[float | None],
-        neighbor_count: int = 24,
-        min_neighbors: int = 4,
-        max_distance: float = 6.0,
-    ) -> float | None:
-        """Predict the VE needed to achieve target_afr using EGO-corrected log VE and actual AFR neighbors."""
-        if abs(target_afr) < 1e-9:
-            return None
-
-        candidates: list[tuple[float, float]] = []
-        for rpm, map_val, ve_corr, afr in zip(rpm_values, map_values, ve_corrected_values, afr_values):
-            if afr is None or abs(float(afr)) < 1e-9 or abs(float(ve_corr)) < 1e-9:
-                continue
-            rpm_dist = abs(float(rpm) - target_rpm) / 500.0
-            map_dist = abs(float(map_val) - target_map) / 10.0
-            distance = (rpm_dist * rpm_dist) + (map_dist * map_dist)
-            # Scale EGO-corrected VE by actual/target AFR ratio to predict VE needed for target AFR
-            ve_predicted = float(ve_corr) * (float(afr) / target_afr)
-            candidates.append((distance, ve_predicted))
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item[0])
-        selected = candidates[: max(1, neighbor_count)]
-        close_selected = [item for item in selected if item[0] <= max_distance]
-        if len(close_selected) < max(1, min_neighbors):
-            return None
-
-        selected = close_selected
-        predicted_values = [value for _, value in selected]
-        weights = [1.0 / (distance + 0.05) for distance, _ in selected]
-        return MainWindow._weighted_average(predicted_values, weights)
-
-    @staticmethod
-    def _round_ve_prediction(value: float) -> float:
-        return round(float(value), 1)
-
     @staticmethod
     def _default_data_dir() -> Path:
         cwd_data = Path.cwd() / "tuning_data"
+        return cwd_data if cwd_data.exists() else Path.cwd()
         return cwd_data if cwd_data.exists() else Path.cwd()
