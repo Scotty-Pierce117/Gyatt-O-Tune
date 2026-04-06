@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -2025,7 +2026,61 @@ class MainWindow(QMainWindow):
         self._load_selected_table_row(row_index, preferred_column=column_index)
         return True
 
+    def _apply_axis_history_entry(self, entry: dict[str, Any], use_new_value: bool) -> bool:
+        """Undo/redo an axis value edit recorded by _apply_axis_edit."""
+        if self.tune_data is None:
+            return False
+
+        table_name = str(entry.get("table", ""))
+        axis_key = str(entry.get("axis", ""))
+        index = int(entry.get("index", -1))
+        target_value = float(entry.get("new" if use_new_value else "old", 0.0))
+
+        if not table_name or axis_key not in ("x", "y") or index < 0:
+            return False
+
+        # Navigate to the table so current_x_axis / current_y_axis are resolved.
+        item = self._find_table_list_item(table_name)
+        if item is None:
+            return False
+        self.table_list.setCurrentItem(item)
+        if self.current_table is None:
+            return False
+
+        axis = self.current_x_axis if axis_key == "x" else self.current_y_axis
+        if axis is None or index >= len(axis.values):
+            return False
+
+        # axis.values is always the original loaded value (never written to directly).
+        # A pending edit equal to the original means the position is back to baseline.
+        edit_key = "x_axis" if axis_key == "x" else "y_axis"
+        original_val = float(axis.values[index])
+        state = self.pending_edits_per_table.setdefault(table_name, {"rows": {}, "one_d": None})
+        axis_edits: dict[int, float] = dict(state.get(edit_key) or {})
+        if abs(target_value - original_val) <= 1e-9:
+            axis_edits.pop(index, None)
+        else:
+            axis_edits[index] = target_value
+        if axis_edits:
+            state[edit_key] = axis_edits
+        else:
+            state.pop(edit_key, None)
+            if (not state.get("rows") and state.get("one_d") is None
+                    and not state.get("x_axis") and not state.get("y_axis")):
+                self.pending_edits_per_table.pop(table_name, None)
+
+        if self.current_table is not None:
+            self._render_table(self.current_table, self.current_x_axis, self.current_y_axis)
+        axis_display = "X" if axis_key == "x" else "Y"
+        self.statusBar().showMessage(
+            f"{axis_display} axis value at index {index + 1} set to {target_value:g} ({axis.name})"
+        )
+        return True
+
     def _apply_history_entry(self, entry: dict[str, Any], use_new_value: bool) -> bool:
+        if entry.get("type") == "axis_edit":
+            return self._apply_axis_history_entry(entry, use_new_value)
+
         if self.tune_data is None:
             return False
 
@@ -3304,6 +3359,7 @@ class MainWindow(QMainWindow):
         self.table_grid.on_redo = self._on_selected_table_cell_redo_requested
         self.table_grid.horizontalHeader().setVisible(False)
         self.table_grid.verticalHeader().setVisible(True)  # leftmost axis labels
+        self.table_grid.verticalHeader().sectionDoubleClicked.connect(self._on_y_axis_header_double_clicked)
 
         table_grid_container = QWidget()
         self.table_grid_container = table_grid_container
@@ -4287,6 +4343,10 @@ class MainWindow(QMainWindow):
         self._load_selected_table_row(source_row, preferred_column=None, select_editor_cell=False)
 
     def _on_table_grid_cell_double_clicked(self, row: int, column: int) -> None:
+        # Check if the user double-clicked the X axis footer row.
+        if self.current_table is not None and row == self.table_grid.rowCount() - 1:
+            self._on_x_axis_footer_double_clicked(column)
+            return
         # Double-click should open the row editor and focus the corresponding editor cell.
         if self._is_current_table_1d():
             source_row = 0
@@ -4297,6 +4357,110 @@ class MainWindow(QMainWindow):
 
         editor_column = self._table_cell_to_editor_column(source_row, column)
         self._load_selected_table_row(source_row, preferred_column=editor_column, select_editor_cell=True)
+
+    def _on_x_axis_footer_double_clicked(self, col: int) -> None:
+        """Handle double-click on the X axis footer row to edit an axis value."""
+        if self.tune_data is None or self.current_table is None:
+            return
+        # Determine the display X axis (for 1D column tables it is current_y_axis).
+        _, display_x_axis, _ = self._table_display_state(self.current_table, self.current_x_axis, self.current_y_axis)
+        if display_x_axis is None or display_x_axis.source_tag == "synthetic":
+            return
+        if col < 0 or col >= len(display_x_axis.values):
+            return
+        _x_edit_key = "y_axis" if (display_x_axis is self.current_y_axis) else "x_axis"
+        _tbl_name_x = self._current_table_name()
+        _state_x = self.pending_edits_per_table.get(_tbl_name_x or "", {}) if _tbl_name_x else {}
+        current_val = float((_state_x.get(_x_edit_key) or {}).get(col, display_x_axis.values[col]))
+        axis_label = display_x_axis.name
+        new_val, ok = QInputDialog.getDouble(
+            self,
+            "Edit X Axis Value",
+            f"X axis value for '{axis_label}' at column {col + 1}:",
+            current_val,
+            decimals=4,
+        )
+        if not ok or abs(new_val - current_val) < 1e-9:
+            return
+        # Determine whether the display X axis corresponds to the table's X or Y axis.
+        axis_key = "y" if (display_x_axis is self.current_y_axis) else "x"
+        self._apply_axis_edit(axis_key, col, new_val)
+
+    def _on_y_axis_header_double_clicked(self, section: int) -> None:
+        """Handle double-click on the Y axis vertical header to edit an axis value."""
+        if self.tune_data is None or self.current_table is None or self.current_y_axis is None:
+            return
+        # Skip 1D tables — they have no editable Y header.
+        if self._is_current_table_1d():
+            return
+        if self.current_y_axis.source_tag == "synthetic":
+            return
+        row_count = self.current_table.rows
+        if section < 0 or section >= row_count:
+            return  # Ignore the empty footer section
+        # Table rows are displayed in reverse order (highest Y at top).
+        source_row = row_count - 1 - section
+        if source_row < 0 or source_row >= len(self.current_y_axis.values):
+            return
+        _tbl_name_y = self._current_table_name()
+        _state_y = self.pending_edits_per_table.get(_tbl_name_y or "", {}) if _tbl_name_y else {}
+        current_val = float((_state_y.get("y_axis") or {}).get(source_row, self.current_y_axis.values[source_row]))
+        axis_label = self.current_y_axis.name
+        new_val, ok = QInputDialog.getDouble(
+            self,
+            "Edit Y Axis Value",
+            f"Y axis value for '{axis_label}' at row {source_row + 1}:",
+            current_val,
+            decimals=4,
+        )
+        if not ok or abs(new_val - current_val) < 1e-9:
+            return
+        self._apply_axis_edit("y", source_row, new_val)
+
+    def _apply_axis_edit(self, axis_key: str, index: int, new_val: float) -> None:
+        """Apply an in-place axis value edit, track it as a pending change, and record for undo."""
+        if self.tune_data is None or self.current_table is None:
+            return
+        table_name = self._current_table_name()
+        if table_name is None:
+            return
+        axis = self.current_x_axis if axis_key == "x" else self.current_y_axis
+        if axis is None or index < 0 or index >= len(axis.values):
+            return
+
+        edit_key = "x_axis" if axis_key == "x" else "y_axis"
+        # Get the effective "old" value: a prior pending edit takes precedence over the
+        # original axis value, so undo correctly restores to the intermediate state.
+        state = self.pending_edits_per_table.setdefault(table_name, {"rows": {}, "one_d": None})
+        existing_edits = state.get(edit_key) or {}
+        old_val = float(existing_edits.get(index, axis.values[index]))
+
+        # Only store the pending edit — do NOT write to axis.values so the main table
+        # keeps showing the original axis labels; the modified preview overlays the change.
+        state.setdefault(edit_key, {})[index] = new_val
+
+        # Push to global undo stack (skip if no real change or already inside undo/redo replay).
+        if not self._history_is_applying and abs(new_val - old_val) > 1e-9:
+            self._flush_active_global_cell_edit()
+            self.global_undo_stack.append({
+                "type": "axis_edit",
+                "table": table_name,
+                "axis": axis_key,
+                "index": index,
+                "old": old_val,
+                "new": new_val,
+            })
+            if len(self.global_undo_stack) > 5000:
+                self.global_undo_stack = self.global_undo_stack[-5000:]
+            self.global_redo_stack.clear()
+            self._refresh_history_action_state()
+
+        # Re-render to reflect changes immediately.
+        self._render_table(self.current_table, self.current_x_axis, self.current_y_axis)
+        axis_display = "X" if axis_key == "x" else "Y"
+        self.statusBar().showMessage(
+            f"{axis_display} axis value at index {index + 1} changed to {new_val:g} ({axis.name})"
+        )
 
     def _on_table_grid_current_cell_changed(
         self,
@@ -4573,7 +4737,8 @@ class MainWindow(QMainWindow):
                     state["one_d"] = None
                 elif self.selected_table_row_idx is not None:
                     state.get("rows", {}).pop(self.selected_table_row_idx, None)
-                if not state.get("rows") and state.get("one_d") is None:
+                if (not state.get("rows") and state.get("one_d") is None
+                        and not state.get("x_axis") and not state.get("y_axis")):
                     self.pending_edits_per_table.pop(table_name, None)
 
         self._refresh_table_row_editor()
@@ -4806,11 +4971,13 @@ class MainWindow(QMainWindow):
             self.tune_loader.save(self.tune_data, dest)
         except Exception as exc:  # noqa: BLE001
             self._restore_table_values(self.tune_data, pre_save_snapshot)
+            self._sync_axis_vectors_from_tables()
             QMessageBox.critical(self, "Save Error", f"Could not save tune file:\n{exc}")
             return
 
         # Persist staged edits to disk, but keep the in-memory workspace exactly as it was pre-save.
         self._restore_table_values(self.tune_data, pre_save_snapshot)
+        self._sync_axis_vectors_from_tables()
 
         self.statusBar().showMessage(f"Saved tune: {dest.name}")
         self.loaded_tune_path = dest
@@ -4915,7 +5082,8 @@ class MainWindow(QMainWindow):
             else:
                 rows_state.pop(self.selected_table_row_idx, None)
 
-        if not table_state.get("rows") and table_state.get("one_d") is None:
+        if (not table_state.get("rows") and table_state.get("one_d") is None
+                and not table_state.get("x_axis") and not table_state.get("y_axis")):
             self.pending_edits_per_table.pop(table_name, None)
 
     def _staged_row_values(self, table_name: str, table: TableData, row_index: int | None) -> list[float] | None:
@@ -5040,18 +5208,26 @@ class MainWindow(QMainWindow):
         x_labels: list[str],
         y_labels: list[str],
         diff_cells: set[tuple[int, int]] | None = None,
+        axis_diff_cols: set[int] | None = None,
+        y_axis_diff_rows: set[int] | None = None,
     ) -> None:
         row_count = len(matrix)
         col_count = len(matrix[0]) if matrix else 0
         display_matrix = list(reversed(matrix))
         diff_cells = diff_cells or set()
+        axis_diff_cols = axis_diff_cols or set()
 
         grid.clear()
         grid.setRowCount(row_count + 1)
         grid.setColumnCount(col_count)
         if isinstance(grid, CopyPasteTableWidget):
             grid.set_footer_rows(1)
-        grid.setVerticalHeaderLabels(y_labels + [""])
+        for section_i, section_label in enumerate(y_labels + [""]):
+            h_item = QTableWidgetItem(section_label)
+            h_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if y_axis_diff_rows and section_i in y_axis_diff_rows:
+                h_item.setBackground(QColor(210, 65, 65, 210))
+            grid.setVerticalHeaderItem(section_i, h_item)
 
         minimum, maximum = self._matrix_min_max(display_matrix)
         span = max(maximum - minimum, 1e-9)
@@ -5071,7 +5247,10 @@ class MainWindow(QMainWindow):
             axis_item = QTableWidgetItem(label)
             axis_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             axis_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            axis_item.setBackground(QColor(60, 60, 60))
+            if col in axis_diff_cols:
+                axis_item.setBackground(QColor(210, 65, 65, 210))
+            else:
+                axis_item.setBackground(QColor(60, 60, 60))
             grid.setItem(axis_row, col, axis_item)
 
         grid.resizeColumnsToContents()
@@ -5102,7 +5281,55 @@ class MainWindow(QMainWindow):
         if diff_cells is None:
             diff_cells = self._diff_cells(base_matrix, modified_matrix)
 
-        if not diff_cells:
+        # Determine pending axis edits for this table.
+        table_name: str | None = None
+        if self.tune_data is not None:
+            for name, t in self.tune_data.tables.items():
+                if t is table:
+                    table_name = name
+                    break
+        axis_x_edits: dict[int, float] = {}
+        axis_y_edits: dict[int, float] = {}
+        if table_name is not None:
+            state = self.pending_edits_per_table.get(table_name, {})
+            raw_x = state.get("x_axis")
+            raw_y = state.get("y_axis")
+            if isinstance(raw_x, dict):
+                axis_x_edits = raw_x
+            if isinstance(raw_y, dict):
+                axis_y_edits = raw_y
+
+        # Map axis edits to display column indices for the footer highlight.
+        # For 1D column tables the display X axis is the original Y axis.
+        axis_diff_cols: set[int] = set()
+        if display_x_axis is y_axis:
+            axis_diff_cols = set(axis_y_edits.keys())
+        else:
+            axis_diff_cols = set(axis_x_edits.keys())
+
+        # Compute modified x/y labels for the preview by overlaying pending axis edits.
+        modified_x_labels = list(x_labels)
+        modified_y_labels = list(y_labels)
+        y_axis_diff_display_rows: set[int] = set()
+
+        # X footer labels: use y_axis edits when display_x is the y_axis (1D column), else x edits.
+        x_src_edits = axis_y_edits if (display_x_axis is y_axis) else axis_x_edits
+        for src_idx, new_v in x_src_edits.items():
+            di = int(src_idx)
+            if 0 <= di < len(modified_x_labels):
+                modified_x_labels[di] = f"{float(new_v):g}"
+
+        # Y header labels (reversed source order) — only for real 2D y-axes.
+        if display_x_axis is not y_axis:
+            for src_idx, new_v in axis_y_edits.items():
+                disp_i = row_count - 1 - int(src_idx)
+                if 0 <= disp_i < len(modified_y_labels):
+                    modified_y_labels[disp_i] = f"{float(new_v):g}"
+                    y_axis_diff_display_rows.add(disp_i)
+
+        has_axis_edits = bool(axis_x_edits or axis_y_edits)
+
+        if not diff_cells and not has_axis_edits:
             self.modified_table_meta.setVisible(False)
             self.modified_table_grid.setVisible(False)
             self.modified_table_grid.clear()
@@ -5114,7 +5341,11 @@ class MainWindow(QMainWindow):
         self.modified_table_meta.setText(f"{display_name} (modified)")
         self.modified_table_meta.setVisible(True)
         self.modified_table_grid.setVisible(True)
-        self._populate_table_grid(self.modified_table_grid, modified_matrix, x_labels, y_labels, diff_cells=diff_cells)
+        self._populate_table_grid(
+            self.modified_table_grid, modified_matrix, modified_x_labels, modified_y_labels,
+            diff_cells=diff_cells, axis_diff_cols=axis_diff_cols,
+            y_axis_diff_rows=y_axis_diff_display_rows,
+        )
 
     def _table_matrix_with_pending_edits(
         self,
@@ -5226,6 +5457,48 @@ class MainWindow(QMainWindow):
                 if not isinstance(row_index, int) or not isinstance(row_values, list):
                     continue
                 apply_row_edit(table_name, row_index, [float(value) for value in row_values])
+
+        # Apply pending axis edits to the actual AxisVector objects and their 1D table entries.
+        for table_name, saved in self.pending_edits_per_table.items():
+            for axis_key_str in ("x", "y"):
+                edits = saved.get(f"{axis_key_str}_axis")
+                if not isinstance(edits, dict) or not edits:
+                    continue
+                tbl = self.tune_data.tables.get(table_name)
+                if tbl is None:
+                    continue
+                if tbl is self.current_table:
+                    axis = self.current_x_axis if axis_key_str == "x" else self.current_y_axis
+                else:
+                    resolved_x, resolved_y = self.tune_data.resolve_table_axes(tbl)
+                    axis = resolved_x if axis_key_str == "x" else resolved_y
+                if axis is None:
+                    continue
+                axis_table = self.tune_data.tables.get(axis.name)
+                for idx, val in edits.items():
+                    if not isinstance(idx, int):
+                        continue
+                    if 0 <= idx < len(axis.values):
+                        axis.values[idx] = val
+                    if axis_table is not None:
+                        if axis.orientation == "row" and axis_table.rows == 1 and idx < axis_table.cols:
+                            axis_table.values[0][idx] = val
+                        elif axis.orientation == "column" and axis_table.cols == 1 and idx < axis_table.rows:
+                            axis_table.values[idx][0] = val
+
+    def _sync_axis_vectors_from_tables(self) -> None:
+        """Re-sync all AxisVector.values from their corresponding 1D table entries.
+        Called after _restore_table_values so the vectors stay consistent with restored table data."""
+        if self.tune_data is None:
+            return
+        for axis_name, axis in self.tune_data.vectors.items():
+            axis_table = self.tune_data.tables.get(axis_name)
+            if axis_table is None:
+                continue
+            if axis.orientation == "row" and axis_table.rows == 1:
+                axis.values = [float(v) for v in axis_table.values[0]]
+            elif axis.orientation == "column" and axis_table.cols == 1:
+                axis.values = [float(row[0]) for row in axis_table.values]
 
     def _table_content_width(self) -> int:
         frame = self.table_grid.frameWidth() * 2
